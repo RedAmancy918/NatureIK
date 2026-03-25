@@ -1,0 +1,106 @@
+# 基于 train_ik_resnet_DeltaJoint，增加机器人结构编码 (URDF)
+# 用于对比有/无结构编码的实验
+# task: ik_parquet_DeltaJoint_stru (use_robot_feature: true, obs_dim=296)
+
+defaults:
+  - _self_
+  - task: ik_parquet_DeltaJoint_stru
+
+_target_: diffusion_policy.workspace.train_diffusion_resnet_lowdim_workspace.TrainDiffusionResNetLowdimWorkspace
+
+horizon: 20
+n_obs_steps: 3
+n_action_steps: 4
+pred_action_steps_only: true
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: false
+  resume: false
+  lr_scheduler: cosine
+  lr_warmup_steps: 0
+  num_epochs: 200
+  gradient_accumulate_every: 1
+  tqdm_interval_sec: 1.0
+  rollout_every: 100000000000
+  checkpoint_every: 10
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  use_ema: false
+
+policy:
+  _target_: diffusion_policy.policy.diffusion_resnet_lowdim_policy.DiffusionResNetLowdimPolicy
+  horizon: ${horizon}
+  obs_dim: 296   # 20 (base) + 276 (robot_feature from URDF)
+  action_dim: 6
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+
+  obs_as_global_cond: true  # 必须为 true
+  pred_action_steps_only: ${pred_action_steps_only}
+  obs_as_local_cond: false
+  oa_step_convention: false
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    prediction_type: epsilon
+
+  model:
+    _target_: diffusion_policy.model.diffusion.conditional_resnet1d.ConditionalResNet1D
+    input_dim: 6
+    global_cond_dim: 888  # n_obs_steps * obs_dim = 3 * 296
+    hidden_dim: 512
+    n_blocks: 8
+
+dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+  persistent_workers: false
+
+val_dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  weight_decay: 1.0e-4
+
+logging:
+  project: diffusion_policy_ik
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_ik_resnet_DeltaJoint_stru_${task.name}
+  tags: ["ik_resnet_lowdim", "DeltaJoint_stru", "${task.name}"]
+  id: null
+  group: null
+  resume: false
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 5
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+ema:
+  _target_: diffusers.training_utils.EMAModel
+  power: 0.75
+  inv_gamma: 1.0
+  min_value: 0.0
+  max_value: 0.9999

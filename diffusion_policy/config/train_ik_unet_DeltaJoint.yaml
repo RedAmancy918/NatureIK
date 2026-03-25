@@ -1,0 +1,111 @@
+defaults:
+  - _self_
+  - task: ik_parquet_DeltaJoint
+
+_target_: diffusion_policy.workspace.train_diffusion_unet_lowdim_workspace.TrainDiffusionUnetLowdimWorkspace
+
+horizon: 20
+n_obs_steps: 3
+n_action_steps: 8
+pred_action_steps_only: true
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: false
+  resume: false
+  lr_scheduler: cosine
+  lr_warmup_steps: 0
+  num_epochs: 200
+  gradient_accumulate_every: 1
+  tqdm_interval_sec: 1.0
+  rollout_every: 100000000000
+  checkpoint_every: 10
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  use_ema: false
+
+policy:
+  _target_: diffusion_policy.policy.diffusion_unet_lowdim_policy.DiffusionUnetLowdimPolicy
+  # _target_: diffusion_policy.policy.diffusion_unet_lowdim_mlp_policy.DiffusionUnetLowdimMLPPolicy
+  horizon: ${horizon}
+  obs_dim: 20
+  action_dim: 6
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+
+  obs_as_global_cond: true
+  pred_action_steps_only: ${pred_action_steps_only}
+  obs_as_local_cond: false
+  oa_step_convention: false
+
+  #obs_encoder_hidden_dims: [256, 256]
+  #obs_encoder_output_dim: 256
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    prediction_type: epsilon
+
+  model:
+    _target_: diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
+    input_dim: 6
+    local_cond_dim: null
+    global_cond_dim: ${eval:'${n_obs_steps} * 20'}
+    # global_cond_dim: 256
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: false
+
+dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+  persistent_workers: false
+
+val_dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  weight_decay: 1.0e-4
+
+logging:
+  project: diffusion_policy_ik
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_ik_unet_lowdim_${task.name}
+  tags: ["ik_unet_lowdim", "${task.name}"]
+  id: null
+  group: null
+  resume: false
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 5
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+ema:
+  _target_: diffusers.training_utils.EMAModel
+  power: 0.75
+  inv_gamma: 1.0
+  min_value: 0.0
+  max_value: 0.9999

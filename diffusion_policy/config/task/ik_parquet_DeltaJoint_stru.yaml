@@ -1,0 +1,44 @@
+# 基于 ik_parquet_DeltaJoint，增加机器人结构编码 (use_robot_feature: true)
+# 用于与无结构编码版本对比实验
+# author: Geo
+# date: 2026-02-03
+
+name: ik_parquet_deltajoint_stru
+
+shape_meta:
+  obs:
+    obs: {shape: [296], type: low_dim}  # 20 + 276 (robot_feature)
+  action:
+    action: {shape: [6], type: low_dim}
+
+dataset:
+  _target_: diffusion_policy.dataset.parquet_DeltaJoint_dataset.ParquetDeltaJointDataset
+  data_dir: null
+  scan_chunk_subdirs: false
+  chunk_dir_glob: "chunk-*"
+
+  horizon: ${horizon}
+  stride: 1
+
+  q_curr_key: observation.state
+  q_tgt_key: action
+  eef_curr_key: observation.state_quat
+  eef_tgt_key: action_quat
+
+  cache_in_memory: true
+  val_ratio: 0.1
+  split_by_episode: true
+  seed: 44
+
+  use_robot_feature: true
+  robot_name: airbot_single_arm
+  max_joints: 16
+
+  wrap_delta_action: false
+
+env_runner:
+  _target_: diffusion_policy.env_runner.null_lowdim_runner.NullLowdimRunner
+  n_envs: 1
+  max_steps: 1
+  render: false
+  video_dir: null

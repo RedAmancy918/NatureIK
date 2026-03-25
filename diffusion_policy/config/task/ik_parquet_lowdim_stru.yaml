@@ -1,0 +1,35 @@
+# author: Geo
+# date: 2026-02-03、
+# ik_parquet_lowdim.yaml
+name: ik_parquet_lowdim
+
+shape_meta:
+  obs:
+    obs: {shape: [283], type: low_dim}
+  action:
+    action: {shape: [6], type: low_dim}
+
+dataset:
+  _target_: diffusion_policy.dataset.parquet_lowdim_dataset.ParquetLowdimDataset
+  data_dir: null
+  # 当前使用的obs是quat，所以obs_key是observation.state_quat，如果使用rpy，则obs_key是observation.state_gpos。
+  obs_key: observation.state_quat
+  action_key: action
+  obs_repr: quat
+  canonicalize_quat: true
+  horizon: ${horizon}
+  stride: 1
+  cache_in_memory: true
+  val_ratio: 0.1
+  split_by_episode: true
+
+  use_robot_feature: true
+  robot_name: airbot_single_arm
+  max_joints: 16
+
+env_runner:
+  _target_: diffusion_policy.env_runner.null_lowdim_runner.NullLowdimRunner
+  n_envs: 1
+  max_steps: 1
+  render: false
+  video_dir: null
