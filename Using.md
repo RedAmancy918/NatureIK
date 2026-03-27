@@ -23,6 +23,11 @@ policy diffusion_unet_lowdim_mlp_policy.py
 eval eval_ik
 
 2026.3.23新增了一个对比resnet的结构编码的对比模型。
+2026.3.26 新增 IK Diffusion Transformer (DiT) 方案（cross-attention Transformer 去噪网络）。
+  - 模型：IKDiffuserModel（ik_transformer.py）+ IKDiffuserPolicy（ik_diffuser_policy.py）
+  - 数据集：IKParquetDataset（ik_parquet_dataset.py），obs=末端位姿(7D)，action=绝对关节角(6D)
+  - 配置：train_ik_dit.yaml + task/ik_parquet_dit.yaml
+  - 训练：python train.py --config-name=train_ik_dit task.dataset.data_dir=.../chunk-000
 如果不使用机器人结构那么
 
   use_robot_feature: true
@@ -45,3 +50,7 @@ python -m diffusion_policy.workspace.train_diffusion_resnet_lowdim_workspace \
   dataset.scan_chunk_subdirs=true
 ```
 实现见 `diffusion_policy/dataset/parquet_path_utils.py`（不依赖 lerobot 包，仅匹配路径布局）。
+
+```bash eval脚本
+python eval_ik.py   -c /home/user/yjh/diffusion_policy/outputs/2026-03-26/00-46-32/checkpoints/epoch=0190-val_loss=0.006763.ckpt   -o /home/user/yjh/diffusion_policy/outputs/eval_results_0190   -d /home/user/Data/data/airbot/2026_0322_airbot_ALL_SplitNoRGB/data/chunk-000   --device cuda:0
+```

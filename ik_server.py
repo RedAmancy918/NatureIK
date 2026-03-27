@@ -82,12 +82,11 @@ class BaseIKSolver(ABC):
     @abstractmethod
     def solve_arm(self, q_curr: np.ndarray, ee_curr: np.ndarray, ee_target: np.ndarray) -> np.ndarray:
         pass
-
+# 四元数对齐逻辑，w 在索引 6.也就是假设[x, y, z, w, qx, qy, qz, qw]
 def _align_quaternions(p: np.ndarray):
-    """四元数对齐逻辑，w 在索引 6"""
     p = p.reshape(1, -1)
-    mask = p[..., 6] < 0
-    p[mask, 3:7] = -p[mask, 3:7]
+    mask = p[..., 6] < 0 # w 小于 0 说明四元数在下半球,需要翻转
+    p[mask, 3:7] = -p[mask, 3:7] # 对齐四元数半球[x, y, z, w]
     return p[0]
 
 class NatureIKSolver(BaseIKSolver):

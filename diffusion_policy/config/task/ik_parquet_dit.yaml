@@ -1,0 +1,43 @@
+# IK Diffusion Transformer 任务配置
+# ====================================
+# 与 DeltaJoint 的区别：
+#   - obs = 末端位姿（7 维，xyz + quat），而非拼接的 20 维
+#   - action = 绝对关节角（6 维），而非 delta_q
+#   - horizon = 1（单步 IK，不做时序预测）
+#   - 数据集使用 IKParquetDataset（读 state_quat + observation.state/action）
+#
+# 数据路径
+# --------
+# 单 chunk:   data_dir = .../chunk-000
+# 多 chunk:   data_dir = .../data，并设 scan_chunk_subdirs: true
+
+name: ik_parquet_dit
+
+shape_meta: &shape_meta
+  obs:
+    state_quat:
+      shape: [7]
+      type: low_dim
+  action:
+    shape: [6]
+    type: low_dim
+
+dataset:
+  _target_: diffusion_policy.dataset.ik_parquet_dataset.IKParquetDataset
+  # 数据目录（运行时通过命令行覆盖）
+  data_dir: null
+  # LeRobot 多 chunk 布局时设为 true
+  scan_chunk_subdirs: false
+  chunk_dir_glob: "chunk-*"
+
+  horizon: 1
+  seed: 44
+  val_ratio: 0.1
+  max_episodes: null
+
+env_runner:
+  _target_: diffusion_policy.env_runner.null_lowdim_runner.NullLowdimRunner
+  n_envs: 1
+  max_steps: 1
+  render: false
+  video_dir: null

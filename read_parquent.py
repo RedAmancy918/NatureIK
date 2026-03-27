@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 # p = "/home/user/Data/data/airbot/2026_0322_airbot_ALL_SplitNoRGB/data/chunk-000/episode_000000.parquet"
-p = "ErrorData/error_data_euler/data/chunk-000/episode_000001.parquet"
+p = "experiment_logs/ik_log_20260326s.parquet"
 df = pd.read_parquet(p)
 
 print("==== columns ====")

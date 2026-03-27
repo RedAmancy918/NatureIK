@@ -1,0 +1,105 @@
+# IK Diffusion Transformer 训练配置
+# ====================================
+# 与 train_ik_resnet_DeltaJoint 的对比：
+#   - 模型：IKDiffuserModel（cross-attention Transformer）替代 ConditionalResNet1D
+#   - obs 输入：末端位姿（7 维），通过 cross-attention 条件化
+#   - action 目标：绝对关节角（6 维），而非 delta_q
+#   - horizon = 1（单步 IK）
+#
+# 启动示例：
+#   python train.py --config-name=train_ik_dit \
+#     task.dataset.data_dir=/path/to/data/chunk-000
+#
+# 多 chunk 全量训练：
+#   python train.py --config-name=train_ik_dit \
+#     task.dataset.data_dir=/path/to/data \
+#     task.dataset.scan_chunk_subdirs=true
+
+defaults:
+  - _self_
+  - task: ik_parquet_dit
+
+_target_: diffusion_policy.workspace.train_ik_workspace.TrainIKWorkspace
+
+horizon: 1
+n_obs_steps: 1
+n_action_steps: 1
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: false
+  resume: false
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 200
+  gradient_accumulate_every: 1
+  tqdm_interval_sec: 1.0
+  checkpoint_every: 10
+  val_every: 1
+  max_train_steps: null
+  max_val_steps: null
+  use_ema: true
+
+policy:
+  _target_: diffusion_policy.policy.ik_diffuser_policy.IKDiffuserPolicy
+  # cross-attention Transformer 超参
+  n_embd: 256      # 嵌入维度
+  n_layer: 4       # Transformer Block 层数（可改为 6/8 提升容量）
+  n_head: 8        # 注意力头数（n_embd 必须整除 n_head）
+  num_inference_steps: null   # null = 等于训练步数（100）
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: true
+    prediction_type: epsilon
+
+dataloader:
+  batch_size: 256
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+  persistent_workers: false
+
+val_dataloader:
+  batch_size: 256
+  num_workers: 8
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  weight_decay: 1.0e-3
+
+logging:
+  project: diffusion_policy_ik
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_ik_dit_${task.name}
+  tags: ["ik_dit", "${task.name}"]
+  id: null
+  group: null
+  resume: false
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 5
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
