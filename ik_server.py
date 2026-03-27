@@ -229,7 +229,7 @@ def health(): return {"status": "ok", "solver": app.state.solver.__class__.__nam
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", default="outputs/2026-03-26/00-46-32/checkpoints/epoch=0190-val_loss=0.006763.ckpt")
-    parser.add_argument("--urdf", default="diffusion_policy/urdf_data/play_g2_usb_cam.urdf")
+    parser.add_argument("--urdf", default="diffusion_policy/urdf_data/play_g2_usb_cam/urdf/play_g2_usb_cam.urdf")
     parser.add_argument("--robot", default="airbot_single_arm")
     args = parser.parse_args()
 
