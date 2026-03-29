@@ -4,10 +4,11 @@ defaults:
 
 _target_: diffusion_policy.workspace.train_diffusion_resnet_lowdim_workspace.TrainDiffusionResNetLowdimWorkspace
 
-horizon: 20
-n_obs_steps: 3
-n_action_steps: 4
-pred_action_steps_only: true
+# 单步IK训练，长horizon的作用有限，主要n_
+horizon: 4         # ← 序列总长
+n_obs_steps: 3      # ← 用3帧历史obs作为global_cond (3×20=60维)
+n_action_steps: 1   #← 推理时只执行4步
+pred_action_steps_only: true  # ← 训练时也只对这4步算loss
 
 training:
   device: "cuda:0"
@@ -93,7 +94,7 @@ checkpoint:
     monitor_key: val_loss
     mode: min
     k: 5
-    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+    format_str: 'resnet_DeltaJoint_h${horizon}_obs${n_obs_steps}_act${n_action_steps}-epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
   save_last_ckpt: true
   save_last_snapshot: false
 

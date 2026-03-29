@@ -28,6 +28,7 @@ except ImportError:
 
 try:
     from curobo.wrap.replan.arm_replan import ArmReplanner
+
     HAS_CUROBO = True
 except ImportError:
     HAS_CUROBO = False
@@ -38,6 +39,7 @@ try:
     from diffusion_policy.dataset.robot_specs import ROBOT_SPECS
 except ImportError as e:
     cprint(f"[!] NatureIK 核心库未安装: {e}", "red")
+
 
 # ==========================================
 # 1. 异步实验日志记录器 (守护线程版)
@@ -64,42 +66,55 @@ class ExperimentLogger:
                 while not self.queue.empty() and len(batch) < 100:
                     batch.append(self.queue.get_nowait())
                 if batch:
-                    file_path = os.path.join(self.log_dir, f"ik_log_{datetime.now().strftime('%Y%m%d')}.parquet")
+                    file_path = os.path.join(
+                        self.log_dir,
+                        f"ik_log_{datetime.now().strftime('%Y%m%d')}.parquet",
+                    )
                     df = pd.DataFrame(batch)
                     if os.path.exists(file_path):
                         try:
                             old_df = pd.read_parquet(file_path)
                             df = pd.concat([old_df, df], ignore_index=True)
-                        except: pass
+                        except:
+                            pass
                     df.to_parquet(file_path, index=False)
             except queue.Empty:
                 continue
+
 
 # ==========================================
 # 2. 求解器策略接口与实现
 # ==========================================
 class BaseIKSolver(ABC):
     @abstractmethod
-    def solve_arm(self, q_curr: np.ndarray, ee_curr: np.ndarray, ee_target: np.ndarray) -> np.ndarray:
+    def solve_arm(
+        self, q_curr: np.ndarray, ee_curr: np.ndarray, ee_target: np.ndarray
+    ) -> np.ndarray:
         pass
+
+
 # 四元数对齐逻辑，w 在索引 6.也就是假设[x, y, z, w, qx, qy, qz, qw]
 def _align_quaternions(p: np.ndarray):
     p = p.reshape(1, -1)
-    mask = p[..., 6] < 0 # w 小于 0 说明四元数在下半球,需要翻转
-    p[mask, 3:7] = -p[mask, 3:7] # 对齐四元数半球[x, y, z, w]
+    mask = p[..., 6] < 0  # w 小于 0 说明四元数在下半球,需要翻转
+    p[mask, 3:7] = -p[mask, 3:7]  # 对齐四元数半球[x, y, z, w]
     return p[0]
+
 
 class NatureIKSolver(BaseIKSolver):
     def __init__(self, ckpt, robot_name):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        payload = torch.load(open(ckpt, "rb"), pickle_module=__import__('dill'))
+        payload = torch.load(open(ckpt, "rb"), pickle_module=__import__("dill"))
         self.cfg = payload["cfg"]
-        cls = __import__('hydra').utils.get_class(self.cfg._target_)
-        workspace = cls(self.cfg); workspace.load_payload(payload)
-        self.policy = workspace.ema_model if self.cfg.training.use_ema else workspace.model
+        cls = __import__("hydra").utils.get_class(self.cfg._target_)
+        workspace = cls(self.cfg)
+        workspace.load_payload(payload)
+        self.policy = (
+            workspace.ema_model if self.cfg.training.use_ema else workspace.model
+        )
         self.policy.to(self.device).eval()
         self.robot_feature = None
-        if self.cfg.task.dataset.get('use_robot_feature', False):
+        if self.cfg.task.dataset.get("use_robot_feature", False):
             f_map = build_robot_feature_map(ROBOT_SPECS, max_joints=16)
             self.robot_feature = f_map[robot_name].astype(np.float32)
         cprint(f"[*] NatureIK (ResNet) 加载成功", "magenta")
@@ -113,7 +128,8 @@ class NatureIKSolver(BaseIKSolver):
         obs_ts = torch.from_numpy(obs).float().to(self.device).view(1, 1, -1)
         with torch.no_grad():
             res = self.policy.predict_action({"obs": obs_ts})
-            return res['action_pred'].cpu().numpy()[0, 0]
+            return res["action_pred"].cpu().numpy()[0, 0]
+
 
 class PinocchioIKSolver(BaseIKSolver):
     def __init__(self, urdf_path, ee_link="link_eef"):
@@ -128,10 +144,12 @@ class PinocchioIKSolver(BaseIKSolver):
             pin.forwardKinematics(self.model, self.data, q)
             d_se3 = self.data.oMi[self.ee_id].inverse() * target_se3
             err = pin.log6(d_se3).np
-            if np.linalg.norm(err) < 1e-4: break
+            if np.linalg.norm(err) < 1e-4:
+                break
             J = pin.computeJointJacobian(self.model, self.data, q, self.ee_id)
             q = pin.integrate(self.model, q, np.linalg.pinv(J) @ err)
         return q - q_curr[:6]
+
 
 class PyBulletIKSolver(BaseIKSolver):
     def __init__(self, urdf_path):
@@ -142,35 +160,48 @@ class PyBulletIKSolver(BaseIKSolver):
         self.pb_ee_index = -1
         for i in range(p.getNumJoints(self.pb_robot_id)):
             info = p.getJointInfo(self.pb_robot_id, i)
-            if info[2] != p.JOINT_FIXED: self.pb_movable_joints.append(i)
+            if info[2] != p.JOINT_FIXED:
+                self.pb_movable_joints.append(i)
             l_name = info[12].decode("utf-8").lower()
-            if any(x in l_name for x in ["end", "eef", "gripper"]): self.pb_ee_index = i
-        if self.pb_ee_index == -1: self.pb_ee_index = self.pb_movable_joints[5]
+            if any(x in l_name for x in ["end", "eef", "gripper"]):
+                self.pb_ee_index = i
+        if self.pb_ee_index == -1:
+            self.pb_ee_index = self.pb_movable_joints[5]
 
     def solve_arm(self, q_curr, ee_curr, ee_target):
         for i in range(min(len(self.pb_movable_joints), 6)):
             p.resetJointState(self.pb_robot_id, self.pb_movable_joints[i], q_curr[i])
         ik_sol = p.calculateInverseKinematics(
-            self.pb_robot_id, self.pb_ee_index, ee_target[:3], ee_target[3:7],
-            maxNumIterations=100, residualThreshold=1e-5
+            self.pb_robot_id,
+            self.pb_ee_index,
+            ee_target[:3],
+            ee_target[3:7],
+            maxNumIterations=100,
+            residualThreshold=1e-5,
         )
         return np.array(ik_sol[:6]) - q_curr[:6]
 
+
 class CuRoboSolver(BaseIKSolver):
-    def __init__(self, urdf): cprint("[*] cuRobo 模式已选择，请确保初始化逻辑完整", "yellow")
-    def solve_arm(self, q_curr, ee_curr, ee_target): return np.zeros(6)
+    def __init__(self, urdf):
+        cprint("[*] cuRobo 模式已选择，请确保初始化逻辑完整", "yellow")
+
+    def solve_arm(self, q_curr, ee_curr, ee_target):
+        return np.zeros(6)
+
 
 # ==========================================
 # 3. FastAPI 核心接口 (对齐机器人端)
 # ==========================================
 app = FastAPI()
 
+
 @app.post("/predict")
 async def predict_endpoint(
     background_tasks: BackgroundTasks,
-    action_eef: str = Form(...),   # Pi0 输出 (16D)
-    joint_now: str = Form(...),    # 机器人当前关节 (14D)
-    eef_now: str = Form(...)       # 机器人当前末端 (14D)
+    action_eef: str = Form(...),  # Pi0 输出 (16D)
+    joint_now: str = Form(...),  # 机器人当前关节 (14D)
+    eef_now: str = Form(...),  # 机器人当前末端 (16D)
 ):
     try:
         start_t = time.perf_counter()
@@ -178,13 +209,16 @@ async def predict_endpoint(
         q_all = np.array(json.loads(joint_now), dtype=np.float32)
         ee_all = np.array(json.loads(eef_now), dtype=np.float32)
         pi_act = np.array(json.loads(action_eef), dtype=np.float32)
-        
+
         ik: BaseIKSolver = app.state.solver
-        
-        # 双臂拆解: Left [0:7], Right [7:14] (EEF) | Left [0:8], Right [8:16] (Pi0 Action)
+
+        # 双臂拆解:
+        #   joint_now (14D): Left q[0:7], Right q[7:14]
+        #   eef_now   (16D): Left ee[0:7] + Left g[7], Right ee[8:15] + Right g[15]
+        #   action_eef(16D): Left ee[0:7] + Left g[7], Right ee[8:15] + Right g[15]
         q_l, q_r = q_all[0:7], q_all[7:14]
-        ee_l, ee_r = ee_all[0:7], ee_all[7:14]
-        
+        ee_l, ee_r = ee_all[0:7], ee_all[8:15]  # 跳过 [7]=左夹爪，取右臂 ee
+
         # Pi0: [L_ee(7), L_g(1), R_ee(7), R_g(1)]
         et_l, g_l = pi_act[0:7], pi_act[7]
         et_r, g_r = pi_act[8:15], pi_act[15]
@@ -194,8 +228,10 @@ async def predict_endpoint(
         dq_r = ik.solve_arm(q_r, ee_r, et_r)
 
         # 积分叠加 (q_next = q_curr + delta_q)
-        q_next_l = q_l.copy(); q_next_l[:6] += dq_l[:6]
-        q_next_r = q_r.copy(); q_next_r[:6] += dq_r[:6]
+        q_next_l = q_l.copy()
+        q_next_l[:6] += dq_l[:6]
+        q_next_r = q_r.copy()
+        q_next_r[:6] += dq_r[:6]
 
         # 缝合 16 维全量信号: [L_q(7), L_g(1), R_q(7), R_g(1)]
         full_action = np.zeros(16)
@@ -204,53 +240,79 @@ async def predict_endpoint(
 
         # 异步实验日志
         latency = (time.perf_counter() - start_t) * 1000
-        app.state.logger.log({
-            "timestamp": datetime.now().isoformat(),
-            "solver": ik.__class__.__name__,
-            "latency_ms": latency,
-            "q_now": q_all.tolist(),
-            "ee_now": ee_all.tolist(),
-            "ee_target": pi_act[[0,1,2,3,4,5,6, 8,9,10,11,12,13,14]].tolist(),
-            "actions": full_action.tolist()
-        })
+        app.state.logger.log(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "solver": ik.__class__.__name__,
+                "latency_ms": latency,
+                "q_now": q_all.tolist(),
+                "ee_now": ee_all.tolist(),
+                "ee_target": pi_act[
+                    [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
+                ].tolist(),
+                "actions": full_action.tolist(),
+            }
+        )
 
         # 返回机器人端期望的 "actions" 字段
         return {"success": True, "actions": full_action.tolist()}
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
+
 @app.get("/health")
-def health(): return {"status": "ok", "solver": app.state.solver.__class__.__name__}
+def health():
+    return {"status": "ok", "solver": app.state.solver.__class__.__name__}
+
 
 # ==========================================
 # 4. 启动入口
 # ==========================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", default="outputs/2026-03-26/00-46-32/checkpoints/epoch=0190-val_loss=0.006763.ckpt")
-    parser.add_argument("--urdf", default="diffusion_policy/urdf_data/play_g2_usb_cam/urdf/play_g2_usb_cam.urdf")
+    parser.add_argument(
+        "--ckpt",
+        default="outputs/2026-03-26/00-46-32/checkpoints/epoch=0190-val_loss=0.006763.ckpt",
+    )
+    parser.add_argument(
+        "--urdf",
+        default="diffusion_policy/urdf_data/play_g2_usb_cam/urdf/play_g2_usb_cam.urdf",
+    )
     parser.add_argument("--robot", default="airbot_single_arm")
     args = parser.parse_args()
 
     if not os.path.exists(args.urdf):
-        cprint(f"[!] URDF 不存在: {args.urdf}", "red"); return
+        cprint(f"[!] URDF 不存在: {args.urdf}", "red")
+        return
 
     cprint("\n--- AIRBOT IK Expert Server Launcher ---", "green", attrs=["bold"])
-    print(" [1] NatureIK (Diffusion-ResNet)\n [2] Pinocchio (Numerical)\n [3] cuRobo (GPU)\n [4] PyBullet (DLS)")
+    print(
+        " [1] NatureIK (Diffusion-ResNet)\n [2] Pinocchio (Numerical)\n [3] cuRobo (GPU)\n [4] PyBullet (DLS)"
+    )
     choice = input("\n请选择求解器编号: ").strip()
 
     try:
-        if choice == "1": app.state.solver = NatureIKSolver(args.ckpt, args.robot)
-        elif choice == "2": app.state.solver = PinocchioIKSolver(args.urdf)
-        elif choice == "3": app.state.solver = CuRoboSolver(args.urdf)
-        elif choice == "4": app.state.solver = PyBulletIKSolver(args.urdf)
-        else: return
+        if choice == "1":
+            app.state.solver = NatureIKSolver(args.ckpt, args.robot)
+        elif choice == "2":
+            app.state.solver = PinocchioIKSolver(args.urdf)
+        elif choice == "3":
+            app.state.solver = CuRoboSolver(args.urdf)
+        elif choice == "4":
+            app.state.solver = PyBulletIKSolver(args.urdf)
+        else:
+            return
     except Exception as e:
-        cprint(f"[!] 初始化失败: {e}", "red"); return
+        cprint(f"[!] 初始化失败: {e}", "red")
+        return
 
     app.state.logger = ExperimentLogger()
-    cprint(f"🚀 服务已启动 [Port 6162] | 模式: {app.state.solver.__class__.__name__}", "green")
+    cprint(
+        f"🚀 服务已启动 [Port 6162] | 模式: {app.state.solver.__class__.__name__}",
+        "green",
+    )
     uvicorn.run(app, host="0.0.0.0", port=6162, log_level="warning")
+
 
 if __name__ == "__main__":
     main()

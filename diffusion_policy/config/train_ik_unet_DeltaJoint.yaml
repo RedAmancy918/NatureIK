@@ -99,7 +99,7 @@ checkpoint:
     monitor_key: val_loss
     mode: min
     k: 5
-    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+    format_str: 'unet_DeltaJoint_h${horizon}_obs${n_obs_steps}_act${n_action_steps}-epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
   save_last_ckpt: true
   save_last_snapshot: false
 
