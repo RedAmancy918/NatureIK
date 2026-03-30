@@ -5,9 +5,9 @@ defaults:
 _target_: diffusion_policy.workspace.train_diffusion_resnet_lowdim_workspace.TrainDiffusionResNetLowdimWorkspace
 
 # 单步IK训练，长horizon的作用有限，主要n_
-horizon: 4         # ← 序列总长
+horizon: 20         # ← 序列总长 4
 n_obs_steps: 3      # ← 用3帧历史obs作为global_cond (3×20=60维)
-n_action_steps: 1   #← 推理时只执行4步
+n_action_steps: 4   #← 推理时只执行4步 1
 pred_action_steps_only: true  # ← 训练时也只对这4步算loss
 
 training:

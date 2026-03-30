@@ -125,9 +125,15 @@ class NatureIKSolver(BaseIKSolver):
         obs = np.concatenate([q_curr[:6], ec, et], axis=-1)
         if self.robot_feature is not None:
             obs = np.concatenate([obs, self.robot_feature], axis=-1)
-        obs_ts = torch.from_numpy(obs).float().to(self.device).view(1, 1, -1)
+
+        # 模型期望 (B, n_obs_steps, D)，当前只有单帧，重复补齐
+        n_obs = self.policy.n_obs_steps
+        obs_ts = torch.from_numpy(obs).float().to(self.device)
+        obs_ts = obs_ts.unsqueeze(0).unsqueeze(0).repeat(1, n_obs, 1)  # (1, n_obs, D)
+
         with torch.no_grad():
             res = self.policy.predict_action({"obs": obs_ts})
+            # pred_action_steps_only=True 时 action_pred shape: (B, n_action_steps, 6)
             return res["action_pred"].cpu().numpy()[0, 0]
 
 
@@ -233,10 +239,12 @@ async def predict_endpoint(
         q_next_r = q_r.copy()
         q_next_r[:6] += dq_r[:6]
 
-        # 缝合 16 维全量信号: [L_q(7), L_g(1), R_q(7), R_g(1)]
-        full_action = np.zeros(16)
-        full_action[0:7], full_action[7] = q_next_l, g_l
-        full_action[8:15], full_action[15] = q_next_r, g_r
+        # 缝合 14 维全量信号: [L_j(6), L_g(1), R_j(6), R_g(1)]
+        full_action = np.zeros(14)
+        full_action[0:6] = q_next_l[:6]   # 左臂 6 关节
+        full_action[6]   = float(g_l)     # 左夹爪
+        full_action[7:13] = q_next_r[:6]  # 右臂 6 关节
+        full_action[13]  = float(g_r)     # 右夹爪
 
         # 异步实验日志
         latency = (time.perf_counter() - start_t) * 1000
@@ -254,7 +262,7 @@ async def predict_endpoint(
             }
         )
 
-        # 返回机器人端期望的 "actions" 字段
+        # 返回机器人端期望的 "actions" 字段 (14D: L_j×6 + L_g + R_j×6 + R_g)
         return {"success": True, "actions": full_action.tolist()}
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
