@@ -91,6 +91,9 @@ class BaseIKSolver(ABC):
         self, q_curr: np.ndarray, ee_curr: np.ndarray, ee_target: np.ndarray
     ) -> np.ndarray:
         pass
+    #新增双臂推理接口
+    def solve_dual_arm(self, q_l, ee_l, et_l, q_r, ee_r, et_r):
+        return self.solve_arm(q_l, ee_l, et_l), self.solve_arm(q_r, ee_r, et_r)
 
 
 # 四元数对齐逻辑，w 在索引 6.也就是假设[x, y, z, w, qx, qy, qz, qw]
@@ -135,7 +138,24 @@ class NatureIKSolver(BaseIKSolver):
             res = self.policy.predict_action({"obs": obs_ts})
             # pred_action_steps_only=True 时 action_pred shape: (B, n_action_steps, 6)
             return res["action_pred"].cpu().numpy()[0, 0]
+            #双臂推理接口实现
+    def solve_dual_arm(self, q_l, ee_l, et_l, q_r, ee_r, et_r):
+        def _build(q, ee, et):
+            ec = _align_quaternions(ee)[:7]
+            et_ = _align_quaternions(et)[:7]
+            obs = np.concatenate([q[:6], ec, et_], axis=-1)
+            if self.robot_feature is not None:
+                obs = np.concatenate([obs, self.robot_feature], axis=-1)
+            return obs
 
+        obs_batch = np.stack([_build(q_l, ee_l, et_l), _build(q_r, ee_r, et_r)], axis=0)
+        obs_ts = torch.from_numpy(obs_batch).float().to(self.device).unsqueeze(1)  # (2,1,20)
+        with torch.no_grad():
+            res = self.policy.predict_action({"obs": obs_ts})
+        actions = res["action_pred"].cpu().numpy()
+        if actions.ndim == 3:
+            actions = actions[:, 0, :]
+        return actions[0], actions[1]
 
 class PinocchioIKSolver(BaseIKSolver):
     def __init__(self, urdf_path, ee_link="link_eef"):
@@ -229,9 +249,13 @@ async def predict_endpoint(
         et_l, g_l = pi_act[0:7], pi_act[7]
         et_r, g_r = pi_act[8:15], pi_act[15]
 
-        # 核心求解 (Delta Q)
-        dq_l = ik.solve_arm(q_l, ee_l, et_l)
-        dq_r = ik.solve_arm(q_r, ee_r, et_r)
+        # 核心求解 (Delta Q) 顺序推理（单臂推理）
+        # dq_l = ik.solve_arm(q_l, ee_l, et_l)
+        # dq_r = ik.solve_arm(q_r, ee_r, et_r)
+
+        # NatureIKSolver 走 B=2 并行（双臂推理）；Pinocchio/PyBullet 自动兜底顺序调用（单臂推理） 
+        # #新增双臂推理接口
+        dq_l, dq_r = ik.solve_dual_arm(q_l, ee_l, et_l, q_r, ee_r, et_r)  # (6,) * 2
 
         # 积分叠加 (q_next = q_curr + delta_q)
         q_next_l = q_l.copy()
