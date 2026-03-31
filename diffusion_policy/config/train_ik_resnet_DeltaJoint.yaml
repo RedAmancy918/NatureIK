@@ -40,6 +40,7 @@ policy:
   pred_action_steps_only: ${pred_action_steps_only}
   obs_as_local_cond: false
   oa_step_convention: false
+  num_inference_steps: 10 # 设置推理步数为10步，默认跟随noise_scheduler.config.num_train_timesteps=100
 
   noise_scheduler:
     _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler

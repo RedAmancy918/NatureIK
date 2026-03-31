@@ -116,6 +116,19 @@ class NatureIKSolver(BaseIKSolver):
             workspace.ema_model if self.cfg.training.use_ema else workspace.model
         )
         self.policy.to(self.device).eval()
+        # TensorRT 级编译优化
+        try:
+            cprint("[*] 正在为 NatureIK 开启 TensorRT 级编译优化...", "yellow")
+            # 使用 reduce-overhead 模式，针对小 Batch 循环推理最有效
+            self.policy = torch.compile(self.policy, mode="reduce-overhead")
+            # 预热一次，防止第一次请求时卡顿
+            dummy_obs = torch.randn(2, self.policy.n_obs_steps, 20).to(self.device)
+            with torch.no_grad():
+                _ = self.policy.predict_action({"obs": dummy_obs})
+            cprint("[*] NatureIK 编译预热完成！", "green")
+        except Exception as e:
+            cprint(f"[!] 编译失败（版本或环境不支持）: {e}", "red")
+            
         self.robot_feature = None
         if self.cfg.task.dataset.get("use_robot_feature", False):
             f_map = build_robot_feature_map(ROBOT_SPECS, max_joints=16)

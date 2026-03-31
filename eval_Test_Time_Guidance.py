@@ -1,19 +1,20 @@
 """
-DiffusionIK 推理性能 Benchmark
-================================
-参考 vla_scripts 中 flowmatching 的多配置测试思路，针对 IKDiffuserPolicy 的
-推理瓶颈进行系统性诊断和量化。
+DiffusionIK 推理性能 Benchmark（ResNet 版）
+============================================
+基于 benchmark_diffusion_ik.py 修改，将测试对象从 IKDiffuserModel（DiT）
+替换为你实际使用的 ConditionalResNet1D + DiffusionResNetLowdimPolicy。
 
 运行方式（无需 checkpoint，直接用随机权重测速）：
     python benchmark_diffusion_ik.py
 
-主要测试维度：
+测试维度与原版一致：
     1. 分段计时 —— 找到单次推理的瓶颈在哪一步
     2. 推理步数扫参 —— num_inference_steps 对延迟的影响
-    3. 调度器对比 —— DDPM vs DDIM（步数相同时的速度差异）
-    4. 模型规模扫参 —— n_layer / n_embd 的影响
+    3. 调度器对比 —— DDPM vs DDIM
+    4. 模型规模扫参 —— hidden_dim / n_blocks 的影响
     5. torch.compile 效果
-    6. 单臂 vs 双臂（ik_server.py 里 solve_arm 调用 2 次的实际代价）
+    6. 单臂 vs 双臂（顺序 vs B=2 并行）
+    7. torch.profiler 详细 kernel 分析
 """
 
 import os
@@ -26,7 +27,6 @@ import itertools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp import autocast
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
@@ -36,13 +36,21 @@ except ImportError:
     def cprint(msg, *args, **kwargs):
         print(msg)
 
-from tqdm import tqdm
-
-# 把项目根目录加入路径
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-from diffusion_policy.model.diffusion.ik_transformer import IKDiffuserModel
-from diffusion_policy.model.common.normalizer import LinearNormalizer
+from diffusion_policy.model.diffusion.conditional_resnet1d import ConditionalResNet1D
+
+
+# ==============================================================================
+# 默认参数（对应 train_ik_resnet_DeltaJoint.yaml）
+# ==============================================================================
+OBS_DIM      = 20   # 单帧观测维度
+N_OBS_STEPS  = 3    # 历史帧数
+ACTION_DIM   = 6    # 动作维度
+N_ACT_STEPS  = 1    # 推理时执行步数（pred_action_steps_only=true）
+
+# global_cond_dim = n_obs_steps × obs_dim
+GLOBAL_COND_DIM = N_OBS_STEPS * OBS_DIM   # 60
 
 
 # ==============================================================================
@@ -53,40 +61,20 @@ def format_ms(t_sec: float) -> str:
     return f"{t_sec * 1000:.3f} ms"
 
 
-def make_dummy_normalizer(device):
-    """构造一个直通归一化器（scale=1, offset=0），不需要真实数据。"""
-    norm = LinearNormalizer()
-    # 手动填充 obs/state_quat 和 action 两个 key
-    for key, dim in [("obs/state_quat", 7), ("action", 6)]:
-        norm.params_dict[key] = {
-            "scale": torch.ones(dim, device=device),
-            "offset": torch.zeros(dim, device=device),
-            "input_stats": {
-                "min": torch.zeros(dim, device=device),
-                "max": torch.ones(dim, device=device),
-                "mean": torch.zeros(dim, device=device),
-                "std": torch.ones(dim, device=device),
-            },
-        }
-    return norm
-
-
 def build_model_and_scheduler(
-    n_embd: int,
-    n_layer: int,
-    n_head: int,
+    hidden_dim: int = 256,
+    n_blocks: int = 6,
+    global_cond_dim: int = GLOBAL_COND_DIM,
     num_train_timesteps: int = 100,
     scheduler_type: str = "ddpm",
     device: torch.device = torch.device("cuda"),
     dtype=torch.float32,
 ):
-    model = IKDiffuserModel(
-        joint_dim=6,
-        ee_dim=7,
-        n_embd=n_embd,
-        n_layer=n_layer,
-        n_head=n_head,
-        dropout=0.0,  # 推理时关闭 dropout
+    model = ConditionalResNet1D(
+        input_dim=ACTION_DIM,
+        global_cond_dim=global_cond_dim,
+        hidden_dim=hidden_dim,
+        n_blocks=n_blocks,
     ).to(device, dtype=dtype).eval()
 
     if scheduler_type == "ddpm":
@@ -95,6 +83,8 @@ def build_model_and_scheduler(
             beta_start=0.0001,
             beta_end=0.02,
             beta_schedule="squaredcos_cap_v2",
+            variance_type="fixed_small",
+            prediction_type="epsilon",
         )
     elif scheduler_type == "ddim":
         scheduler = DDIMScheduler(
@@ -102,6 +92,7 @@ def build_model_and_scheduler(
             beta_start=0.0001,
             beta_end=0.02,
             beta_schedule="squaredcos_cap_v2",
+            prediction_type="epsilon",
         )
     else:
         raise ValueError(f"未知调度器类型: {scheduler_type}")
@@ -110,22 +101,24 @@ def build_model_and_scheduler(
 
 
 def single_arm_inference(
-    model: IKDiffuserModel,
+    model: ConditionalResNet1D,
     scheduler,
     num_inference_steps: int,
-    ee_cond: torch.Tensor,   # (1, 1, 7)
+    global_cond: torch.Tensor,   # (B, N_OBS_STEPS * OBS_DIM)
     device: torch.device,
     dtype,
 ):
-    """完整单臂推理，对应 IKDiffuserPolicy.predict_action() 的核心逻辑。"""
-    B = ee_cond.shape[0]
-    nq = torch.randn((B, 1, 6), device=device, dtype=dtype)
+    """
+    完整单臂推理，对应 DiffusionResNetLowdimPolicy.conditional_sample() 的核心逻辑。
+    global_cond: (B, 60) = 3帧 obs 展平
+    """
+    B = global_cond.shape[0]
+    trajectory = torch.randn((B, N_ACT_STEPS, ACTION_DIM), device=device, dtype=dtype)
     scheduler.set_timesteps(num_inference_steps)
     for t in scheduler.timesteps:
-        batched_t = torch.full((B,), t.item(), device=device, dtype=torch.long)
-        pred = model(nq, batched_t, cond=ee_cond)
-        nq = scheduler.step(pred, t, nq).prev_sample
-    return nq
+        model_output = model(trajectory, t, global_cond=global_cond)
+        trajectory = scheduler.step(model_output, t, trajectory).prev_sample
+    return trajectory
 
 
 # ==============================================================================
@@ -138,71 +131,65 @@ def test_stage_timing(device, dtype, warmup=10, repeat=200):
     cprint("=" * 60, "yellow")
 
     model, scheduler = build_model_and_scheduler(
-        n_embd=256, n_layer=4, n_head=8,
-        num_train_timesteps=100,
+        hidden_dim=256, n_blocks=6,
         scheduler_type="ddpm",
         device=device, dtype=dtype,
     )
     num_inference_steps = 100
-    ee_cond = torch.randn(1, 1, 7, device=device, dtype=dtype)
-    nq_init = torch.randn(1, 1, 6, device=device, dtype=dtype)
+    gc = torch.randn(1, GLOBAL_COND_DIM, device=device, dtype=dtype)
+    traj_init = torch.randn(1, N_ACT_STEPS, ACTION_DIM, device=device, dtype=dtype)
     scheduler.set_timesteps(num_inference_steps)
     timesteps = scheduler.timesteps
 
     # warmup
     with torch.no_grad():
         for _ in range(warmup):
-            single_arm_inference(model, scheduler, num_inference_steps, ee_cond, device, dtype)
+            single_arm_inference(model, scheduler, num_inference_steps, gc, device, dtype)
     torch.cuda.synchronize()
 
     # ---------- (A) 端到端总时间 ----------
     t0 = time.perf_counter()
     with torch.no_grad():
         for _ in range(repeat):
-            single_arm_inference(model, scheduler, num_inference_steps, ee_cond, device, dtype)
+            single_arm_inference(model, scheduler, num_inference_steps, gc, device, dtype)
     torch.cuda.synchronize()
     t_total = (time.perf_counter() - t0) / repeat
 
     # ---------- (B) 仅模型 forward × 100 步 ----------
     with torch.no_grad():
-        nq = nq_init.clone()
         for _ in range(warmup):
             for t in timesteps:
-                bt = torch.full((1,), t.item(), device=device, dtype=torch.long)
-                _ = model(nq, bt, cond=ee_cond)
+                _ = model(traj_init, t, global_cond=gc)
     torch.cuda.synchronize()
 
     t0 = time.perf_counter()
     with torch.no_grad():
         for _ in range(repeat):
-            nq = nq_init.clone()
             for t in timesteps:
-                bt = torch.full((1,), t.item(), device=device, dtype=torch.long)
-                _ = model(nq, bt, cond=ee_cond)
+                _ = model(traj_init, t, global_cond=gc)
     torch.cuda.synchronize()
     t_model_only = (time.perf_counter() - t0) / repeat
 
-    # ---------- (C) 仅 scheduler.step × 100 步（用零张量模拟） ----------
-    dummy_pred = torch.zeros(1, 1, 6, device=device, dtype=dtype)
+    # ---------- (C) 仅 scheduler.step × 100 步 ----------
+    dummy_pred = torch.zeros(1, N_ACT_STEPS, ACTION_DIM, device=device, dtype=dtype)
     t0 = time.perf_counter()
     with torch.no_grad():
         for _ in range(repeat):
-            nq = nq_init.clone()
+            traj = traj_init.clone()
             for t in timesteps:
-                nq = scheduler.step(dummy_pred, t, nq).prev_sample
+                traj = scheduler.step(dummy_pred, t, traj).prev_sample
     t_scheduler_only = (time.perf_counter() - t0) / repeat
 
     # ---------- (D) 单步 forward（平均每步代价） ----------
-    t = timesteps[50]  # 取中间步
-    bt = torch.full((1,), t.item(), device=device, dtype=torch.long)
+    t_mid = timesteps[50]
     for _ in range(warmup):
         with torch.no_grad():
-            _ = model(nq_init, bt, cond=ee_cond)
+            _ = model(traj_init, t_mid, global_cond=gc)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(repeat * 10):
         with torch.no_grad():
-            _ = model(nq_init, bt, cond=ee_cond)
+            _ = model(traj_init, t_mid, global_cond=gc)
     torch.cuda.synchronize()
     t_single_step = (time.perf_counter() - t0) / (repeat * 10)
 
@@ -233,10 +220,10 @@ def test_inference_steps_sweep(device, dtype, warmup=5, repeat=100):
 
     steps_list = [1, 2, 5, 10, 20, 50, 100]
     model, _ = build_model_and_scheduler(
-        n_embd=256, n_layer=4, n_head=8,
+        hidden_dim=256, n_blocks=6,
         scheduler_type="ddpm", device=device, dtype=dtype,
     )
-    ee_cond = torch.randn(1, 1, 7, device=device, dtype=dtype)
+    gc = torch.randn(1, GLOBAL_COND_DIM, device=device, dtype=dtype)
 
     results = []
     cprint(f"\n  {'步数':>6}  {'延迟(ms)':>12}  {'vs 100步':>10}", "white")
@@ -249,17 +236,18 @@ def test_inference_steps_sweep(device, dtype, warmup=5, repeat=100):
             beta_start=0.0001,
             beta_end=0.02,
             beta_schedule="squaredcos_cap_v2",
+            variance_type="fixed_small",
+            prediction_type="epsilon",
         )
-        # warmup
         with torch.no_grad():
             for _ in range(warmup):
-                single_arm_inference(model, scheduler, n_steps, ee_cond, device, dtype)
+                single_arm_inference(model, scheduler, n_steps, gc, device, dtype)
         torch.cuda.synchronize()
 
         t0 = time.perf_counter()
         with torch.no_grad():
             for _ in range(repeat):
-                single_arm_inference(model, scheduler, n_steps, ee_cond, device, dtype)
+                single_arm_inference(model, scheduler, n_steps, gc, device, dtype)
         torch.cuda.synchronize()
         avg_ms = (time.perf_counter() - t0) / repeat * 1000
 
@@ -273,7 +261,7 @@ def test_inference_steps_sweep(device, dtype, warmup=5, repeat=100):
 
 
 # ==============================================================================
-# 测试 3：调度器对比（DDPM vs DDIM，同步数）
+# 测试 3：调度器对比（DDPM vs DDIM）
 # ==============================================================================
 
 def test_scheduler_comparison(device, dtype, warmup=5, repeat=100):
@@ -282,7 +270,7 @@ def test_scheduler_comparison(device, dtype, warmup=5, repeat=100):
     cprint("=" * 60, "yellow")
 
     steps_list = [5, 10, 20, 50]
-    ee_cond = torch.randn(1, 1, 7, device=device, dtype=dtype)
+    gc = torch.randn(1, GLOBAL_COND_DIM, device=device, dtype=dtype)
 
     cprint(f"\n  {'步数':>6}  {'DDPM(ms)':>12}  {'DDIM(ms)':>12}  {'DDIM加速':>10}", "white")
     cprint("  " + "-" * 46, "white")
@@ -292,18 +280,18 @@ def test_scheduler_comparison(device, dtype, warmup=5, repeat=100):
         timings = {}
         for sched_type in ["ddpm", "ddim"]:
             model, scheduler = build_model_and_scheduler(
-                n_embd=256, n_layer=4, n_head=8,
+                hidden_dim=256, n_blocks=6,
                 scheduler_type=sched_type, device=device, dtype=dtype,
             )
             with torch.no_grad():
                 for _ in range(warmup):
-                    single_arm_inference(model, scheduler, n_steps, ee_cond, device, dtype)
+                    single_arm_inference(model, scheduler, n_steps, gc, device, dtype)
             torch.cuda.synchronize()
 
             t0 = time.perf_counter()
             with torch.no_grad():
                 for _ in range(repeat):
-                    single_arm_inference(model, scheduler, n_steps, ee_cond, device, dtype)
+                    single_arm_inference(model, scheduler, n_steps, gc, device, dtype)
             torch.cuda.synchronize()
             timings[sched_type] = (time.perf_counter() - t0) / repeat * 1000
 
@@ -318,7 +306,7 @@ def test_scheduler_comparison(device, dtype, warmup=5, repeat=100):
 
 
 # ==============================================================================
-# 测试 4：模型规模扫参
+# 测试 4：模型规模扫参（hidden_dim / n_blocks）
 # ==============================================================================
 
 def test_model_size_sweep(device, dtype, n_steps=10, warmup=5, repeat=100):
@@ -327,42 +315,41 @@ def test_model_size_sweep(device, dtype, n_steps=10, warmup=5, repeat=100):
     cprint("=" * 60, "yellow")
 
     configs = list(itertools.product(
-        [128, 256, 512],   # n_embd
-        [2, 4, 6, 8],      # n_layer
+        [128, 256, 512],   # hidden_dim
+        [2, 4, 6, 8],      # n_blocks
     ))
 
-    ee_cond = torch.randn(1, 1, 7, device=device, dtype=dtype)
+    gc = torch.randn(1, GLOBAL_COND_DIM, device=device, dtype=dtype)
 
-    cprint(f"\n  {'n_embd':>8}  {'n_layer':>8}  {'参数量':>12}  {'延迟(ms)':>12}", "white")
-    cprint("  " + "-" * 48, "white")
+    cprint(f"\n  {'hidden_dim':>12}  {'n_blocks':>8}  {'参数量':>12}  {'延迟(ms)':>12}", "white")
+    cprint("  " + "-" * 52, "white")
 
     results = []
-    for n_embd, n_layer in configs:
-        n_head = 8 if n_embd >= 256 else 4
+    for hidden_dim, n_blocks in configs:
         model, scheduler = build_model_and_scheduler(
-            n_embd=n_embd, n_layer=n_layer, n_head=n_head,
+            hidden_dim=hidden_dim, n_blocks=n_blocks,
             scheduler_type="ddpm", device=device, dtype=dtype,
         )
         total_params = sum(p.numel() for p in model.parameters())
 
         with torch.no_grad():
             for _ in range(warmup):
-                single_arm_inference(model, scheduler, n_steps, ee_cond, device, dtype)
+                single_arm_inference(model, scheduler, n_steps, gc, device, dtype)
         torch.cuda.synchronize()
 
         t0 = time.perf_counter()
         with torch.no_grad():
             for _ in range(repeat):
-                single_arm_inference(model, scheduler, n_steps, ee_cond, device, dtype)
+                single_arm_inference(model, scheduler, n_steps, gc, device, dtype)
         torch.cuda.synchronize()
         avg_ms = (time.perf_counter() - t0) / repeat * 1000
 
         params_k = total_params / 1000
         cprint(
-            f"  {n_embd:>8}  {n_layer:>8}  {params_k:>10.1f}K  {avg_ms:>11.2f}ms",
+            f"  {hidden_dim:>12}  {n_blocks:>8}  {params_k:>10.1f}K  {avg_ms:>11.2f}ms",
             "cyan",
         )
-        results.append({"n_embd": n_embd, "n_layer": n_layer, "params_k": params_k, "ms": avg_ms})
+        results.append({"hidden_dim": hidden_dim, "n_blocks": n_blocks, "params_k": params_k, "ms": avg_ms})
 
     return results
 
@@ -376,12 +363,12 @@ def test_torch_compile(device, dtype, n_steps=10, warmup=15, repeat=100):
     cprint(f"  测试 5：torch.compile 加速（{n_steps} 步 DDPM）", "yellow")
     cprint("=" * 60, "yellow")
 
-    ee_cond = torch.randn(1, 1, 7, device=device, dtype=dtype)
+    gc = torch.randn(1, GLOBAL_COND_DIM, device=device, dtype=dtype)
 
     timings = {}
     for mode in ["原始模型", "compile(reduce-overhead)", "compile(max-autotune)"]:
         model, scheduler = build_model_and_scheduler(
-            n_embd=256, n_layer=4, n_head=8,
+            hidden_dim=256, n_blocks=6,
             scheduler_type="ddpm", device=device, dtype=dtype,
         )
         if mode == "compile(reduce-overhead)":
@@ -397,17 +384,16 @@ def test_torch_compile(device, dtype, n_steps=10, warmup=15, repeat=100):
                 cprint(f"  torch.compile 失败: {e}", "red")
                 continue
 
-        # 较多 warmup（compile 需要 trace）
         cprint(f"  正在 warmup: {mode} ...", "white")
         with torch.no_grad():
             for _ in range(warmup):
-                single_arm_inference(model, scheduler, n_steps, ee_cond, device, dtype)
+                single_arm_inference(model, scheduler, n_steps, gc, device, dtype)
         torch.cuda.synchronize()
 
         t0 = time.perf_counter()
         with torch.no_grad():
             for _ in range(repeat):
-                single_arm_inference(model, scheduler, n_steps, ee_cond, device, dtype)
+                single_arm_inference(model, scheduler, n_steps, gc, device, dtype)
         torch.cuda.synchronize()
         avg_ms = (time.perf_counter() - t0) / repeat * 1000
         timings[mode] = avg_ms
@@ -423,7 +409,7 @@ def test_torch_compile(device, dtype, n_steps=10, warmup=15, repeat=100):
 
 
 # ==============================================================================
-# 测试 6：单臂 vs 双臂（ik_server.py 中 solve_arm 调用 2 次的实际代价）
+# 测试 6：单臂 vs 双臂
 # ==============================================================================
 
 def test_single_vs_dual_arm(device, dtype, n_steps=10, warmup=5, repeat=100):
@@ -432,60 +418,68 @@ def test_single_vs_dual_arm(device, dtype, n_steps=10, warmup=5, repeat=100):
     cprint("=" * 60, "yellow")
 
     model, scheduler = build_model_and_scheduler(
-        n_embd=256, n_layer=4, n_head=8,
+        hidden_dim=256, n_blocks=6,
         scheduler_type="ddpm", device=device, dtype=dtype,
     )
-    ee_l = torch.randn(1, 1, 7, device=device, dtype=dtype)
-    ee_r = torch.randn(1, 1, 7, device=device, dtype=dtype)
+    gc_l = torch.randn(1, GLOBAL_COND_DIM, device=device, dtype=dtype)
+    gc_r = torch.randn(1, GLOBAL_COND_DIM, device=device, dtype=dtype)
+    gc_both = torch.cat([gc_l, gc_r], dim=0)  # (2, 60)
 
     # 单臂
     with torch.no_grad():
         for _ in range(warmup):
-            single_arm_inference(model, scheduler, n_steps, ee_l, device, dtype)
+            single_arm_inference(model, scheduler, n_steps, gc_l, device, dtype)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.no_grad():
         for _ in range(repeat):
-            single_arm_inference(model, scheduler, n_steps, ee_l, device, dtype)
+            single_arm_inference(model, scheduler, n_steps, gc_l, device, dtype)
     torch.cuda.synchronize()
     t_single = (time.perf_counter() - t0) / repeat * 1000
 
-    # 双臂（顺序调用，和 ik_server.py 一致）
+    # 双臂顺序
     with torch.no_grad():
         for _ in range(warmup):
-            single_arm_inference(model, scheduler, n_steps, ee_l, device, dtype)
-            single_arm_inference(model, scheduler, n_steps, ee_r, device, dtype)
+            single_arm_inference(model, scheduler, n_steps, gc_l, device, dtype)
+            single_arm_inference(model, scheduler, n_steps, gc_r, device, dtype)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.no_grad():
         for _ in range(repeat):
-            single_arm_inference(model, scheduler, n_steps, ee_l, device, dtype)
-            single_arm_inference(model, scheduler, n_steps, ee_r, device, dtype)
+            single_arm_inference(model, scheduler, n_steps, gc_l, device, dtype)
+            single_arm_inference(model, scheduler, n_steps, gc_r, device, dtype)
     torch.cuda.synchronize()
     t_dual = (time.perf_counter() - t0) / repeat * 1000
 
-    # 双臂并行（batch_size=2，同时处理左右臂）
-    ee_both = torch.cat([ee_l, ee_r], dim=0)  # (2, 1, 7)
+    # 双臂并行 B=2
     with torch.no_grad():
         for _ in range(warmup):
-            single_arm_inference(model, scheduler, n_steps, ee_both, device, dtype)
+            single_arm_inference(model, scheduler, n_steps, gc_both, device, dtype)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.no_grad():
         for _ in range(repeat):
-            single_arm_inference(model, scheduler, n_steps, ee_both, device, dtype)
+            single_arm_inference(model, scheduler, n_steps, gc_both, device, dtype)
     torch.cuda.synchronize()
     t_batch = (time.perf_counter() - t0) / repeat * 1000
 
+    saving = (t_dual - t_batch) / t_dual * 100
     cprint(f"\n  单臂（B=1）                : {t_single:.2f} ms", "cyan")
     cprint(f"  双臂顺序（2 × 单臂）       : {t_dual:.2f} ms   (理论 2x = {t_single*2:.2f} ms)", "cyan")
-    cprint(f"  双臂并行（B=2，单次推理）  : {t_batch:.2f} ms   → 节省 {(t_dual - t_batch)/t_dual*100:.1f}%", "green")
+    cprint(f"  双臂并行（B=2，单次推理）  : {t_batch:.2f} ms   → 节省 {saving:.1f}%", "green")
+
+    if saving > 5:
+        cprint("  ✅ 并行有效，建议保留", "green")
+    elif saving > 0:
+        cprint("  ⚠️  收益较小，保留也无害", "yellow")
+    else:
+        cprint("  ❌ 无收益，建议回滚", "red")
 
     return {"single_ms": t_single, "dual_sequential_ms": t_dual, "dual_batch_ms": t_batch}
 
 
 # ==============================================================================
-# 测试 7：torch.profiler 详细 kernel 分析（可选，输出 chrome trace）
+# 测试 7：torch.profiler 详细 kernel 分析
 # ==============================================================================
 
 def test_profiler(device, dtype, n_steps=10, save_trace=True):
@@ -500,28 +494,23 @@ def test_profiler(device, dtype, n_steps=10, save_trace=True):
         return
 
     model, scheduler = build_model_and_scheduler(
-        n_embd=256, n_layer=4, n_head=8,
+        hidden_dim=256, n_blocks=6,
         scheduler_type="ddpm", device=device, dtype=dtype,
     )
-    ee_cond = torch.randn(1, 1, 7, device=device, dtype=dtype)
+    gc = torch.randn(1, GLOBAL_COND_DIM, device=device, dtype=dtype)
 
-    # warmup
     with torch.no_grad():
         for _ in range(5):
-            single_arm_inference(model, scheduler, n_steps, ee_cond, device, dtype)
+            single_arm_inference(model, scheduler, n_steps, gc, device, dtype)
 
     activities = [ProfilerActivity.CPU]
     if device.type == "cuda":
         activities.append(ProfilerActivity.CUDA)
 
-    with profile(
-        activities=activities,
-        record_shapes=True,
-        with_stack=False,
-    ) as prof:
+    with profile(activities=activities, record_shapes=True, with_stack=False) as prof:
         with torch.no_grad():
             with record_function("single_arm_inference"):
-                single_arm_inference(model, scheduler, n_steps, ee_cond, device, dtype)
+                single_arm_inference(model, scheduler, n_steps, gc, device, dtype)
 
     sort_key = "cuda_time_total" if device.type == "cuda" else "cpu_time_total"
     cprint(f"\n  Top 15 耗时算子（按 {sort_key} 排序）：", "white")
@@ -543,9 +532,9 @@ def print_summary(device, dtype, stage_result, steps_result, sched_result):
     cprint("  汇总：瓶颈诊断 & 优化建议", "green")
     cprint("=" * 60, "green")
 
-    total_ms = stage_result["total_ms"]
-    model_ms = stage_result["model_ms"]
-    sched_ms = stage_result["scheduler_ms"]
+    total_ms  = stage_result["total_ms"]
+    model_ms  = stage_result["model_ms"]
+    sched_ms  = stage_result["scheduler_ms"]
 
     cprint(f"\n  当前端到端（100步，单臂）: {total_ms:.2f} ms", "white")
 
@@ -554,17 +543,16 @@ def print_summary(device, dtype, stage_result, steps_result, sched_result):
     if model_ms / total_ms > 0.6:
         cprint("\n  ⚠  模型 forward 是主要瓶颈 → 建议 torch.compile 或减小模型", "red")
 
-    # 最快步数配置
     best_steps = min(steps_result, key=lambda x: x["ms"])
     cprint(f"\n  最快步数配置: {best_steps['steps']} 步 → {best_steps['ms']:.2f} ms", "green")
     cprint(f"  vs 100步的加速比: {total_ms / best_steps['ms']:.1f}x", "green")
 
     cprint("\n  推荐优先级排序：", "yellow")
-    cprint("    1. 减少 num_inference_steps（改 yaml → 10~20 步）", "yellow")
-    cprint("    2. 切换到 DDIM 调度器（需重新训练或直接替换 scheduler）", "yellow")
+    cprint("    1. 减少 num_inference_steps（yaml 改为 10~20 步）", "yellow")
+    cprint("    2. 切换到 DDIM 调度器", "yellow")
     cprint("    3. 双臂改为 batch_size=2 并行推理（修改 ik_server.py）", "yellow")
     cprint("    4. torch.compile(mode='reduce-overhead')", "yellow")
-    cprint("    5. 蒸馏到 1~5 步（Consistency Distillation）", "yellow")
+    cprint("    5. 缩小 hidden_dim / n_blocks（需重训）", "yellow")
 
 
 # ==============================================================================
@@ -573,21 +561,21 @@ def print_summary(device, dtype, stage_result, steps_result, sched_result):
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float32  # ik_server 里用的 float32
+    dtype  = torch.float32
 
     cprint(f"\n{'='*60}", "green")
-    cprint(f"  DiffusionIK 推理性能 Benchmark", "green")
+    cprint(f"  DiffusionIK 推理性能 Benchmark（ResNet 版）", "green")
     cprint(f"  设备: {device}  |  精度: {dtype}", "green")
+    cprint(f"  模型: ConditionalResNet1D  hidden=256  blocks=6", "green")
+    cprint(f"  输入: obs({GLOBAL_COND_DIM}D) → action({ACTION_DIM}D)", "green")
     cprint(f"{'='*60}", "green")
 
-    # ---- 运行各项测试 ----
-    stage_result  = test_stage_timing(device, dtype)
-    steps_result  = test_inference_steps_sweep(device, dtype)
-    sched_result  = test_scheduler_comparison(device, dtype)
-    _             = test_model_size_sweep(device, dtype, n_steps=10)
-    _             = test_torch_compile(device, dtype, n_steps=10)
-    _             = test_single_vs_dual_arm(device, dtype, n_steps=10)
+    stage_result = test_stage_timing(device, dtype)
+    steps_result = test_inference_steps_sweep(device, dtype)
+    sched_result = test_scheduler_comparison(device, dtype)
+    _            = test_model_size_sweep(device, dtype, n_steps=10)
+    _            = test_torch_compile(device, dtype, n_steps=10)
+    _            = test_single_vs_dual_arm(device, dtype, n_steps=10)
     test_profiler(device, dtype, n_steps=10)
 
-    # ---- 汇总报告 ----
     print_summary(device, dtype, stage_result, steps_result, sched_result)
