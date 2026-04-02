@@ -37,6 +37,12 @@
   - Workspace：`diffusion_policy/workspace/train_ik_workspace.py`
   - 数据集：`diffusion_policy/dataset/ik_parquet_dataset.py`
 
+- **Flow Matching ResNet IK（DeltaJoint）**
+  - 训练配置：`diffusion_policy/config/train_ik_flow_resnet_DeltaJoint.yaml`
+  - 任务配置：`diffusion_policy/config/task/ik_parquet_DeltaJoint.yaml`
+  - Policy：`diffusion_policy/policy/flow_resnet_lowdim_policy.py`
+  - Workspace：`diffusion_policy/workspace/train_flow_resnet_workspace.py`
+  - 说明：保留现有 ResNet + global_cond 结构，训练目标改为速度场，推理改为固定步数 ODE 积分
 ## 2. 数据集组织方式
 
 ### 2.1 单文件夹训练（只读一个 chunk）

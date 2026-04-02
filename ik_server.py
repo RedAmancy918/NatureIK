@@ -96,11 +96,12 @@ class BaseIKSolver(ABC):
         return self.solve_arm(q_l, ee_l, et_l), self.solve_arm(q_r, ee_r, et_r)
 
 
-# 四元数对齐逻辑，w 在索引 6.也就是假设[x, y, z, w, qx, qy, qz, qw]
+# 四元数对齐逻辑：输入 7D eef 向量 [px, py, pz, qx, qy, qz, qw]，w 在索引 6
+# 若 w < 0 则整体取反，保持单位四元数半球一致性
 def _align_quaternions(p: np.ndarray):
     p = p.reshape(1, -1)
-    mask = p[..., 6] < 0  # w 小于 0 说明四元数在下半球,需要翻转
-    p[mask, 3:7] = -p[mask, 3:7]  # 对齐四元数半球[x, y, z, w]
+    mask = p[..., 6] < 0  # w < 0 → 翻转到上半球
+    p[mask, 3:7] = -p[mask, 3:7]  # 翻转四元数部分 [qx, qy, qz, qw]
     return p[0]
 
 
@@ -162,7 +163,10 @@ class NatureIKSolver(BaseIKSolver):
             return obs
 
         obs_batch = np.stack([_build(q_l, ee_l, et_l), _build(q_r, ee_r, et_r)], axis=0)
-        obs_ts = torch.from_numpy(obs_batch).float().to(self.device).unsqueeze(1)  # (2,1,20)
+        # 模型 global_cond_dim = n_obs_steps × obs_dim，必须重复到 n_obs_steps 帧
+        n_obs = self.policy.n_obs_steps
+        obs_ts = torch.from_numpy(obs_batch).float().to(self.device)  # (2, 20)
+        obs_ts = obs_ts.unsqueeze(1).repeat(1, n_obs, 1)              # (2, n_obs_steps, 20)
         with torch.no_grad():
             res = self.policy.predict_action({"obs": obs_ts})
         actions = res["action_pred"].cpu().numpy()

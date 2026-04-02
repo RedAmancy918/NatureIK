@@ -6,7 +6,7 @@ data
 data_local
 .vscode
 _wandb
-
+benchmark_ik_trace.json
 **/.DS_Store
 
 fuse.cfg

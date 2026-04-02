@@ -4,8 +4,12 @@ DiffusionIK 推理性能 Benchmark（ResNet 版）
 基于 benchmark_diffusion_ik.py 修改，将测试对象从 IKDiffuserModel（DiT）
 替换为你实际使用的 ConditionalResNet1D + DiffusionResNetLowdimPolicy。
 
-运行方式（无需 checkpoint，直接用随机权重测速）：
-    python benchmark_diffusion_ik.py
+运行方式：
+    # 随机权重测速
+    python eval_Test_Time_Guidance.py
+
+    # 指定 checkpoint 后测速（会在所有测试中加载该权重）
+    python eval_Test_Time_Guidance.py --checkpoint /path/to/checkpoint.ckpt
 
 测试维度与原版一致：
     1. 分段计时 —— 找到单次推理的瓶颈在哪一步
@@ -23,6 +27,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import sys
 import time
 import itertools
+import argparse
 
 import torch
 import torch.nn as nn
@@ -52,6 +57,11 @@ N_ACT_STEPS  = 1    # 推理时执行步数（pred_action_steps_only=true）
 # global_cond_dim = n_obs_steps × obs_dim
 GLOBAL_COND_DIM = N_OBS_STEPS * OBS_DIM   # 60
 
+# 可选：从命令行传入 checkpoint，供 build_model_and_scheduler 统一加载
+CHECKPOINT_PATH = None
+CHECKPOINT_STRICT = False
+CHECKPOINT_LOAD_LOGGED = False
+
 
 # ==============================================================================
 # 辅助函数
@@ -59,6 +69,47 @@ GLOBAL_COND_DIM = N_OBS_STEPS * OBS_DIM   # 60
 
 def format_ms(t_sec: float) -> str:
     return f"{t_sec * 1000:.3f} ms"
+
+
+def count_parameters(model: nn.Module):
+    """统计 nn.Module 的参数量：返回 (总参数个数, 可训练参数个数)。"""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
+def format_param_count(n: int) -> str:
+    """将整数参数量格式化为易读字符串（如 1.23M）。"""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.3f}M ({n:,})"
+    if n >= 1_000:
+        return f"{n / 1_000:.2f}K ({n:,})"
+    return f"{n:,}"
+
+
+def _extract_model_state_dict(ckpt_obj):
+    """兼容常见 checkpoint 结构，提取模型 state_dict。"""
+    if not isinstance(ckpt_obj, dict):
+        return ckpt_obj
+    for key in ("state_dict", "model_state_dict", "model", "ema_model"):
+        if key in ckpt_obj and isinstance(ckpt_obj[key], dict):
+            return ckpt_obj[key]
+    return ckpt_obj
+
+
+def load_model_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device, strict: bool = False):
+    """加载 checkpoint 到模型，支持自动剥离 'module.' 前缀。"""
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    state_dict = _extract_model_state_dict(ckpt)
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"checkpoint 格式不支持: {checkpoint_path}")
+
+    # 兼容 DDP 保存的 'module.xxx'
+    if any(k.startswith("module.") for k in state_dict.keys()):
+        state_dict = {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
+
+    incompatible = model.load_state_dict(state_dict, strict=strict)
+    return incompatible
 
 
 def build_model_and_scheduler(
@@ -70,12 +121,29 @@ def build_model_and_scheduler(
     device: torch.device = torch.device("cuda"),
     dtype=torch.float32,
 ):
+    global CHECKPOINT_LOAD_LOGGED
     model = ConditionalResNet1D(
         input_dim=ACTION_DIM,
         global_cond_dim=global_cond_dim,
         hidden_dim=hidden_dim,
         n_blocks=n_blocks,
     ).to(device, dtype=dtype).eval()
+
+    if CHECKPOINT_PATH:
+        incompatible = load_model_checkpoint(
+            model=model,
+            checkpoint_path=CHECKPOINT_PATH,
+            device=device,
+            strict=CHECKPOINT_STRICT,
+        )
+        if not CHECKPOINT_LOAD_LOGGED:
+            missing = len(getattr(incompatible, "missing_keys", []))
+            unexpected = len(getattr(incompatible, "unexpected_keys", []))
+            cprint(
+                f"  已加载 checkpoint: {CHECKPOINT_PATH}  (missing={missing}, unexpected={unexpected}, strict={CHECKPOINT_STRICT})",
+                "cyan",
+            )
+            CHECKPOINT_LOAD_LOGGED = True
 
     if scheduler_type == "ddpm":
         scheduler = DDPMScheduler(
@@ -135,7 +203,7 @@ def test_stage_timing(device, dtype, warmup=10, repeat=200):
         scheduler_type="ddpm",
         device=device, dtype=dtype,
     )
-    num_inference_steps = 100
+    num_inference_steps = 10
     gc = torch.randn(1, GLOBAL_COND_DIM, device=device, dtype=dtype)
     traj_init = torch.randn(1, N_ACT_STEPS, ACTION_DIM, device=device, dtype=dtype)
     scheduler.set_timesteps(num_inference_steps)
@@ -330,7 +398,7 @@ def test_model_size_sweep(device, dtype, n_steps=10, warmup=5, repeat=100):
             hidden_dim=hidden_dim, n_blocks=n_blocks,
             scheduler_type="ddpm", device=device, dtype=dtype,
         )
-        total_params = sum(p.numel() for p in model.parameters())
+        total_params, _ = count_parameters(model)
 
         with torch.no_grad():
             for _ in range(warmup):
@@ -560,6 +628,23 @@ def print_summary(device, dtype, stage_result, steps_result, sched_result):
 # ==============================================================================
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="DiffusionIK 推理性能 Benchmark（ResNet 版）")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="可选：模型 checkpoint 路径（.pt/.pth/.ckpt）",
+    )
+    parser.add_argument(
+        "--strict-load",
+        action="store_true",
+        help="可选：strict=True 加载 checkpoint（默认 False）",
+    )
+    args = parser.parse_args()
+
+    CHECKPOINT_PATH = args.checkpoint
+    CHECKPOINT_STRICT = args.strict_load
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype  = torch.float32
 
@@ -568,6 +653,20 @@ if __name__ == "__main__":
     cprint(f"  设备: {device}  |  精度: {dtype}", "green")
     cprint(f"  模型: ConditionalResNet1D  hidden=256  blocks=6", "green")
     cprint(f"  输入: obs({GLOBAL_COND_DIM}D) → action({ACTION_DIM}D)", "green")
+    cprint(f"  Checkpoint: {CHECKPOINT_PATH if CHECKPOINT_PATH else '未指定（随机初始化）'}", "green")
+    cprint(f"{'='*60}", "green")
+
+    _param_model, _ = build_model_and_scheduler(
+        hidden_dim=256, n_blocks=6,
+        scheduler_type="ddpm",
+        device=device, dtype=dtype,
+    )
+    n_total, n_train = count_parameters(_param_model)
+    del _param_model
+    cprint(
+        f"  参数量: 总计 {format_param_count(n_total)}  |  可训练 {format_param_count(n_train)}",
+        "cyan",
+    )
     cprint(f"{'='*60}", "green")
 
     stage_result = test_stage_timing(device, dtype)

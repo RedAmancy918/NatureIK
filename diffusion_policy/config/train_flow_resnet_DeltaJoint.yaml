@@ -1,0 +1,97 @@
+defaults:
+  - _self_
+  - task: ik_parquet_DeltaJoint
+
+_target_: diffusion_policy.workspace.train_flow_resnet_lowdim_workspace.TrainFlowResNetLowdimWorkspace
+
+horizon: 8
+n_obs_steps: 3
+n_action_steps: 4
+pred_action_steps_only: true
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: false
+  resume: false
+  lr_scheduler: cosine
+  lr_warmup_steps: 1000
+  num_epochs: 200
+  gradient_accumulate_every: 1
+  tqdm_interval_sec: 1.0
+  rollout_every: 100000000000
+  checkpoint_every: 10
+  val_every: 1
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  use_ema: true
+
+policy:
+  _target_: diffusion_policy.policy.train_flow_resnet_lowdim_policy.FlowResNetLowdimPolicy
+  horizon: ${horizon}
+  obs_dim: 20
+  action_dim: 6
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+
+  obs_as_global_cond: true
+  pred_action_steps_only: ${pred_action_steps_only}
+  obs_as_local_cond: false
+  oa_step_convention: false
+  num_inference_steps: 4
+  sampling_method: midpoint
+  time_scale: 100.0
+
+  model:
+    _target_: diffusion_policy.model.diffusion.conditional_resnet1d.ConditionalResNet1D
+    input_dim: 6
+    global_cond_dim: ${eval:'${n_obs_steps} * 20'}
+    hidden_dim: 256
+    n_blocks: 6
+
+dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+  persistent_workers: false
+
+val_dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  weight_decay: 1.0e-4
+
+logging:
+  project: flow_ik
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_ik_flow_resnet_${task.name}
+  tags: ["ik_flow_resnet", "${task.name}"]
+  id: null
+  group: null
+  resume: false
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 5
+    format_str: 'flow_resnet_DeltaJoint_h${horizon}_obs${n_obs_steps}_act${n_action_steps}-epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
