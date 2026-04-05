@@ -4,6 +4,7 @@ import time
 import queue
 import threading
 import argparse
+from collections import deque
 import numpy as np
 import pandas as pd
 import torch
@@ -40,6 +41,18 @@ try:
 except ImportError as e:
     cprint(f"[!] NatureIK 核心库未安装: {e}", "red")
 
+try:
+    import sys
+    # MIP repo path — adjust if installed elsewhere
+    _MIP_ROOT = os.path.expanduser("../much-ado-about-noising")
+    if _MIP_ROOT not in sys.path:
+        sys.path.insert(0, _MIP_ROOT)
+    from mip.agent import TrainingAgent
+    from omegaconf import OmegaConf
+    HAS_MIP = True
+except ImportError as e:
+    HAS_MIP = False
+    cprint(f"[!] MIP 库未找到，模式 5 将不可用: {e}", "yellow")
 
 # ==========================================
 # 1. 异步实验日志记录器 (守护线程版)
@@ -104,6 +117,139 @@ def _align_quaternions(p: np.ndarray):
     p[mask, 3:7] = -p[mask, 3:7]  # 翻转四元数部分 [qx, qy, qz, qw]
     return p[0]
 
+class MIPIKSolver(BaseIKSolver):
+    """基于 MIP（流匹配）模型的 IK 求解器。
+
+    从 train_ik.py 保存的推理包中加载：
+        flow_map / encoder / *_ema 权重
+        config  （OmegaConf 容器 → 重建 TrainingAgent）
+        normalizer  （obs + action 归一化器，由训练数据拟合）
+
+    观测历史：
+        模型期望输入 obs_steps 帧的历史观测。由于服务端每次调用只提供当前帧，
+        内部维护一个滚动 buffer；首次调用时用第一帧重复填充 buffer（冷启动）。
+    """
+
+    def __init__(self, ckpt: str):
+        if not HAS_MIP:
+            raise RuntimeError("MIP library not available. Check sys.path.")
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # ── 加载推理包 ────────────────────────────────────────────────────────
+        bundle = torch.load(ckpt, map_location="cpu", weights_only=False)
+
+        # ── 重建 config 与 TrainingAgent ──────────────────────────────────────
+        cfg_dict = bundle["config"]
+        config = OmegaConf.create(cfg_dict)
+        # 单样本推理不需要 compile / CUDA-graphs，关闭以避免额外开销
+        config.optimization.device = str(self.device)
+        config.optimization.use_compile = False
+        config.optimization.use_cudagraphs = False
+        config.optimization.compile_mode = None
+
+        self.agent = TrainingAgent(config)
+        # 分别加载 flow_map 与 encoder 的主参数及 EMA 参数
+        self.agent.flow_map.load_state_dict(bundle["flow_map"])
+        self.agent.encoder.load_state_dict(bundle["encoder"])
+        self.agent.flow_map_ema.load_state_dict(bundle["flow_map_ema"])
+        self.agent.encoder_ema.load_state_dict(bundle["encoder_ema"])
+        self.agent.eval()  # 切换到推理模式，关闭 dropout 等
+
+        # ── 归一化器 ──────────────────────────────────────────────────────────
+        # obs_state: CompositeNormalizer（关节 MinMax + 四元数 Identity）
+        # action:    MinMaxNormalizer（delta_joint 整体缩放到 [-1, 1]）
+        # bundle["normalizer"] 由 convert_checkpoint.py / save_mip_bundle 写入：
+        #   {"obs_state": CompositeNormalizer, "action": MinMaxNormalizer}
+        self._norm_obs    = bundle["normalizer"]["obs_state"]
+        self._norm_action = bundle["normalizer"]["action"]
+
+        # ── 从 config 读取关键维度 ────────────────────────────────────────────
+        self.obs_steps = int(config.task.obs_steps)  # encoder 接收的历史帧数
+        self.horizon   = int(config.task.horizon)    # 动作预测窗口长度
+        self.act_dim   = int(config.task.act_dim)    # 动作维度（delta_joint = 6）
+
+        # 左右臂独立历史 buffer：各自保留最近 obs_steps 帧，互不干扰
+        # 注意：不能共用一个 deque，否则双臂调用时会互相污染历史
+        self._history_l: deque = deque(maxlen=self.obs_steps)  # 左臂专用
+        self._history_r: deque = deque(maxlen=self.obs_steps)  # 右臂专用
+
+        cprint(
+            f"[*] MIP IK Solver loaded | obs_steps={self.obs_steps} "
+            f"horizon={self.horizon} act_dim={self.act_dim} device={self.device}",
+            "magenta",
+        )
+
+    def _make_obs_frame(
+        self,
+        q_curr: np.ndarray,
+        ee_curr: np.ndarray,
+        ee_target: np.ndarray,
+    ) -> np.ndarray:
+        """拼接单帧 obs 向量，格式与训练时完全一致。
+
+        输出维度：20D
+        布局：[q_curr(6) | eef_curr_xyz(3) | eef_curr_quat(4) | eef_tgt_xyz(3) | eef_tgt_quat(4)]
+        四元数均经过半球对齐（w < 0 时取反），避免符号不一致带来的跳变。
+        """
+        ec = _align_quaternions(ee_curr)[:7]    # 当前末端：xyz + quat（已对齐）
+        et = _align_quaternions(ee_target)[:7]  # 目标末端：xyz + quat（已对齐）
+        return np.concatenate([q_curr[:6], ec, et], axis=-1).astype(np.float32)
+
+    def _infer_with_buf(self, buf: deque, frame: np.ndarray) -> np.ndarray:
+        """向指定 buffer 追加当前帧，并执行一次 MIP 推理，返回 delta_q (6,)。
+
+        冷启动时 buffer 为空，用当前帧重复填充至 obs_steps 帧。
+        正常运行时追加当前帧，deque 自动淘汰最旧帧。
+        """
+        if len(buf) == 0:
+            # 冷启动：首帧重复填充，保证 buffer 始终有 obs_steps 帧
+            for _ in range(self.obs_steps):
+                buf.append(frame.copy())
+        else:
+            # 正常运行：追加当前帧，最旧帧被自动淘汰
+            buf.append(frame)
+
+        # 堆叠为 (obs_steps, obs_dim)，归一化 → tensor (1, obs_steps, obs_dim)
+        obs_np   = np.stack(list(buf), axis=0)              # (To, 20)
+        obs_norm = self._norm_obs.normalize(obs_np)          # (To, 20)，逐维线性缩放
+        obs_t    = torch.from_numpy(obs_norm).float().unsqueeze(0).to(self.device)
+
+        # MIP 流匹配推理（2步：零初始化 → 粗估 → 精修）
+        act_0 = torch.zeros(1, self.horizon, self.act_dim, device=self.device)
+        with torch.no_grad():
+            act_norm_t = self.agent.sample(act_0=act_0, obs=obs_t, num_steps=2, use_ema=True)
+
+        # 反归一化，取预测窗口第 0 帧作为本次输出
+        act_norm_np = act_norm_t.cpu().numpy()[0, 0]                        # (act_dim,)
+        delta_q = self._norm_action.unnormalize(act_norm_np[np.newaxis])[0] # (6,)
+        return delta_q
+
+    def solve_arm(
+        self,
+        q_curr: np.ndarray,
+        ee_curr: np.ndarray,
+        ee_target: np.ndarray,
+    ) -> np.ndarray:
+        """单臂推理：使用左臂 buffer（单独调用场景）。"""
+        frame = self._make_obs_frame(q_curr, ee_curr, ee_target)
+        return self._infer_with_buf(self._history_l, frame)
+
+    def solve_dual_arm(
+        self,
+        q_l: np.ndarray, ee_l: np.ndarray, et_l: np.ndarray,
+        q_r: np.ndarray, ee_r: np.ndarray, et_r: np.ndarray,
+    ):
+        """双臂推理：左右臂各用独立 buffer，历史帧互不干扰。
+
+        不能复用基类的顺序调用（那会让两臂共享同一个 deque，
+        导致 buffer 里左右帧交替出现，历史完全错乱）。
+        """
+        frame_l = self._make_obs_frame(q_l, ee_l, et_l)
+        frame_r = self._make_obs_frame(q_r, ee_r, et_r)
+        dq_l = self._infer_with_buf(self._history_l, frame_l)
+        dq_r = self._infer_with_buf(self._history_r, frame_r)
+        return dq_l, dq_r
 
 class NatureIKSolver(BaseIKSolver):
     def __init__(self, ckpt, robot_name):
@@ -324,6 +470,11 @@ def main():
         default="outputs/2026-03-26/00-46-32/checkpoints/epoch=0190-val_loss=0.006763.ckpt",
     )
     parser.add_argument(
+        "--mip_ckpt",
+        default="../much-ado-about-noising/logs/models/model_final_bundle.pt",
+        help="MIP checkpoint path (inference bundle saved by train_ik.py)",
+    )
+    parser.add_argument(
         "--urdf",
         default="diffusion_policy/urdf_data/play_g2_usb_cam/urdf/play_g2_usb_cam.urdf",
     )
@@ -336,7 +487,7 @@ def main():
 
     cprint("\n--- AIRBOT IK Expert Server Launcher ---", "green", attrs=["bold"])
     print(
-        " [1] NatureIK (Diffusion-ResNet)\n [2] Pinocchio (Numerical)\n [3] cuRobo (GPU)\n [4] PyBullet (DLS)"
+        " [1] NatureIK (Diffusion-ResNet)\n [2] Pinocchio (Numerical)\n [3] cuRobo (GPU)\n [4] PyBullet (DLS)\n [5] MIP (Flow-Matching)"
     )
     choice = input("\n请选择求解器编号: ").strip()
 
@@ -349,6 +500,11 @@ def main():
             app.state.solver = CuRoboSolver(args.urdf)
         elif choice == "4":
             app.state.solver = PyBulletIKSolver(args.urdf)
+        elif choice == "5":
+            if args.mip_ckpt is None:
+                cprint(f"[!] 请通过 --mip_ckpt 指定 MIP checkpoint 路径", "red",)
+                return
+            app.state.solver = MIPIKSolver(args.mip_ckpt)
         else:
             return
     except Exception as e:
