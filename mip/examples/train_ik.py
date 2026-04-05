@@ -45,6 +45,34 @@ def timed(section: str, record_dict: dict):
     record_dict[section].append(time.perf_counter() - start)
 
 
+def save_mip_bundle(
+    path: Path,
+    agent: TrainingAgent,
+    config,
+    normalizer: dict,
+) -> None:
+    """Save a self-contained inference bundle for MIPIKSolver.
+
+    Bundle layout:
+        config      - OmegaConf config dict (serialisable, no Python objects)
+        normalizer  - {"obs": {"state": CompositeNormalizer},
+                       "action": MinMaxNormalizer}
+        flow_map / encoder / *_ema  - model state dicts (EMA weights used at inference)
+    """
+    bundle = {
+        "config":     OmegaConf.to_container(config, resolve=True),
+        "normalizer": {
+            "obs_state": normalizer["obs"]["state"],  # CompositeNormalizer
+            "action":    normalizer["action"],         # MinMaxNormalizer
+        },
+        "flow_map":       agent.flow_map.state_dict(),
+        "encoder":        agent.encoder.state_dict(),
+        "flow_map_ema":   agent.flow_map_ema.state_dict(),
+        "encoder_ema":    agent.encoder_ema.state_dict(),
+    }
+    torch.save(bundle, path)
+
+
 def make_ik_dataset(task_config, split: str = "train") -> IKParquetDataset:
     """Instantiate IKParquetDataset from Hydra task config."""
     data_dir = os.path.expanduser(task_config.dataset_path)
@@ -105,29 +133,6 @@ def compute_val_loss(
 # Training loop
 # ---------------------------------------------------------------------------
 
-def _save_inference_bundle(path: Path, agent: TrainingAgent, config, dataset: IKParquetDataset):
-    """Save a self-contained checkpoint bundle for inference (MIPIKSolver).
-
-    Bundle contains:
-        flow_map / encoder / *_ema  : model weights
-        config                      : OmegaConf container (for agent reconstruction)
-        normalizer                  : obs + action normalizer (fit on train data)
-    """
-    normalizer = dataset.get_normalizer()
-    bundle = {
-        "flow_map":     agent.flow_map.state_dict(),
-        "encoder":      agent.encoder.state_dict(),
-        "flow_map_ema": agent.flow_map_ema.state_dict(),
-        "encoder_ema":  agent.encoder_ema.state_dict(),
-        "config":       OmegaConf.to_container(config, resolve=True),
-        "normalizer": {
-            "obs_state": normalizer["obs"]["state"],   # CompositeNormalizer
-            "action":    normalizer["action"],          # MinMaxNormalizer
-        },
-    }
-    torch.save(bundle, path)
-
-
 def train(
     config: Config,
     dataset: IKParquetDataset,
@@ -135,6 +140,7 @@ def train(
     agent: TrainingAgent,
     run_logger: Logger,
     checkpoint_dir: Path = None,
+    normalizer: dict = None,
 ):
     device = config.optimization.device
 
@@ -176,7 +182,17 @@ def train(
     if checkpoint_dir is None:
         checkpoint_dir = Path(os.getcwd()) / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    loguru.logger.info(f"Checkpoints will be saved to: {checkpoint_dir}")
+
+    # ---- Checkpoint name suffix: _{network_type}[_{exp_tag}] ----
+    network_type = getattr(config.network, "network_type", "")
+    exp_tag      = getattr(config.log,     "exp_tag",      "") or ""
+    ckpt_suffix  = f"_{network_type}" if network_type else ""
+    if exp_tag:
+        ckpt_suffix += f"_{exp_tag}"
+
+    loguru.logger.info(
+        f"Checkpoints will be saved to: {checkpoint_dir}  (suffix: '{ckpt_suffix}')"
+    )
 
     best_val_loss = float("inf")
     info_list = []
@@ -252,25 +268,49 @@ def train(
             loguru.logger.info(f"[Step {step + 1:>7d}] val_loss = {val_loss:.5f}")
             pbar.set_postfix(val_loss=f"{val_loss:.5f}", step=step + 1)
 
-            # Save best model (by val_loss), filename includes loss value
-            if val_loss < best_val_loss:
-                # Remove previous best checkpoints
-                for old in checkpoint_dir.glob("step=*-val_loss=*.pt"):
-                    old.unlink()
-                best_val_loss = val_loss
-                best_name = f"step={step + 1:07d}-val_loss={val_loss:.6f}.pt"
-                # Save inference bundle (config + normalizer + weights)
-                _save_inference_bundle(checkpoint_dir / best_name, agent, config, dataset)
-                loguru.logger.info(f"New best model → {best_name}")
+            # Save best model (by val_loss)，保留 val_loss 最小的 top-3
+            _TOP_K = 3
+            best_name = f"step={step + 1:07d}-val_loss={val_loss:.6f}{ckpt_suffix}.pt"
+            if normalizer is not None:
+                save_mip_bundle(checkpoint_dir / best_name, agent, config, normalizer)
+            else:
+                agent.save(checkpoint_dir / best_name)
+            loguru.logger.info(f"Saved checkpoint → {best_name}")
+
+            # 找出所有同 suffix 的最优 checkpoint，按 val_loss 升序，超出 top-k 的删掉
+            pattern = f"step=*-val_loss=*{ckpt_suffix}.pt"
+            existing = list(checkpoint_dir.glob(pattern))
+            def _parse_loss(p):
+                try:
+                    return float(p.stem.split("-val_loss=")[1].split(ckpt_suffix)[0])
+                except Exception:
+                    return float("inf")
+            existing.sort(key=_parse_loss)
+            for old in existing[_TOP_K:]:
+                old.unlink()
+                loguru.logger.info(f"Removed old checkpoint → {old.name}")
+
+            best_val_loss = _parse_loss(existing[0]) if existing else val_loss
 
         # ---- Latest checkpoint (periodic) ----
         if (step + 1) % config.log.save_freq == 0:
-            agent.save(checkpoint_dir / "latest.pt")
-            loguru.logger.info(f"Latest checkpoint saved at step {step + 1}")
+            latest_name = f"latest{ckpt_suffix}.pt"
+            if normalizer is not None:
+                save_mip_bundle(checkpoint_dir / latest_name, agent, config, normalizer)
+            else:
+                agent.save(checkpoint_dir / latest_name)
+            loguru.logger.info(f"Latest checkpoint saved at step {step + 1} → {latest_name}")
 
-    # Final save (inference bundle)
-    final_name = f"step={config.optimization.gradient_steps:07d}-val_loss={best_val_loss:.6f}-final.pt"
-    _save_inference_bundle(checkpoint_dir / final_name, agent, config, dataset)
+    # Final save
+    final_name = (
+        f"step={config.optimization.gradient_steps:07d}"
+        f"-val_loss={best_val_loss:.6f}"
+        f"{ckpt_suffix}-final.pt"
+    )
+    if normalizer is not None:
+        save_mip_bundle(checkpoint_dir / final_name, agent, config, normalizer)
+    else:
+        agent.save(checkpoint_dir / final_name)
     loguru.logger.info(f"Training complete → {final_name}")
 
 
@@ -313,7 +353,7 @@ def main(cfg):
     agent      = TrainingAgent(config)
     run_logger = Logger(config)
 
-    train(config, dataset, val_dataset, agent, run_logger)
+    train(config, dataset, val_dataset, agent, run_logger, normalizer=dataset._normalizer)
 
 
 if __name__ == "__main__":

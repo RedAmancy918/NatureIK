@@ -317,6 +317,34 @@ class TrainingAgent:
             "grad_norm": result["grad_norm"],
         }
 
+    def compute_loss(
+        self,
+        act: torch.Tensor,
+        obs: torch.Tensor,
+        delta_t: torch.Tensor,
+    ) -> dict:
+        """Compute loss without backward or optimizer step. Used for validation.
+
+        Args:
+            act: Action tensor of shape (batch_size, Ta, act_dim)
+            obs: Observation tensor of shape (batch_size, To, obs_dim)
+            delta_t: Time step differences of shape (batch_size,)
+
+        Returns:
+            Dictionary containing the scalar loss value.
+        """
+        with torch.no_grad():
+            loss, _info = self.loss_fn(
+                self.config.optimization,
+                self.flow_map,
+                self.encoder,
+                self.interpolant,
+                act,
+                obs,
+                delta_t,
+            )
+        return {"loss": loss}
+
     def ema_update(self):
         """Update exponential moving average parameters."""
         params = list(self.encoder.parameters()) + list(self.flow_map.parameters())

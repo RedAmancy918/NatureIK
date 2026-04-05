@@ -20,3 +20,4 @@ horizon: 1            # horizon = 1 for pure IK mapping
 max_episode_steps: 300
 num_envs: 1
 val_dataset_percentage: 0.1
+env_type: "ik"

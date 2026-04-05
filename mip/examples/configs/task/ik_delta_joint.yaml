@@ -3,8 +3,8 @@
 #   obs = 20D [q_curr(6) + eef_curr(7) + eef_tgt(7)]
 #   action = 6D delta joint angles
 env_name: "ik_delta_joint"
-env_type: "ik"
 obs_type: "state"
+env_type: "ik"
 action_type: "delta"
 abs_action: false
 
@@ -14,10 +14,17 @@ dataset_path: "/home/user/Data/data/airbot/2026_0322_airbot_ALL_SplitNoRGB/data"
 obs_dim: 20           # q_curr(6) + eef_curr(7) + eef_tgt(7)
 act_dim: 6            # delta joint angles (6-DOF arm)
 
-obs_steps: 2          # 2 frames of history → network learns velocity/smoothness
-act_steps: 1          # execute 1 delta_q at a time
-horizon: 1            # predict 1 step: pure IK mapping
+# config 1：2026-04-03 实验参数
+# obs_steps: 2          # how many obs timesteps fed to encoder
+# act_steps: 1          # action chunk length to execute
+# horizon: 1            # prediction horizon (= act_steps for pure action pred)
+
+# config 2：2026-04-05 实验参数
+obs_steps: 4          # how many obs timesteps fed to encoder
+act_steps: 1          # action chunk length to execute
+horizon: 3            # prediction horizon (= act_steps for pure action pred)
 
 max_episode_steps: 300
 num_envs: 1           # no sim env needed; set to 1 as placeholder
 val_dataset_percentage: 0.1
+
