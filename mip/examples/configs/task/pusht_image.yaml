@@ -1,0 +1,20 @@
+# @package task
+defaults:
+  - pusht_base
+  - _self_
+
+obs_type: "image"
+
+# Shape metadata for image observations
+shape_meta:
+  action:
+    shape: [2]
+  obs:
+    image:
+      shape: [3, 96, 96]
+      type: rgb
+    agent_pos:
+      shape: [2]
+      type: low_dim
+
+obs_dim: 128  # Embedding dimension, not actual obs dim

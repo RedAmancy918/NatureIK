@@ -1,0 +1,32 @@
+# @package _global_
+# Fast experiment configuration
+defaults:
+  - /optimization: default
+  - /network: mlp
+  - /task: lift_ph_image
+  - /log: default
+  - _self_
+
+mode: "train"
+
+optimization:
+  gradient_steps: 10
+  batch_size: 2
+  auto_resume: false
+  use_compile: false
+  compile_mode: "default"
+  use_cudagraphs: false
+
+log:
+  wandb_mode: "disabled"
+  eval_freq: 10
+  log_freq: 1
+  save_freq: 10
+  eval_episodes: 2
+
+task:
+  num_envs: 2
+# network:
+#   num_layers: 1
+#   expansion_factor: 1
+#   emb_dim: 128

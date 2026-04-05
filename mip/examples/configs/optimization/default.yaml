@@ -1,0 +1,29 @@
+# @package optimization
+defaults:
+  - _self_
+
+seed: 0
+loss_type: "mip"
+loss_scale: 1.0
+norm_type: "l2" # "l1", "l2", "smooth_l1"
+lr: 1e-4
+weight_decay: 1e-5
+num_steps: 1
+sample_mode: "zero"
+t_two_step: 0.9
+discrete_dt: 0.01
+grad_clip_norm: 10.0
+ema_rate: 0.995
+batch_size: 1024
+gradient_steps: 300000
+warmup_ratio: 0.0
+rampup_ratio: 0.0
+min_value: 1.0
+max_value: 1.0
+model_path: null
+interp_type: "linear"
+device: "cuda"
+use_compile: false
+compile_mode: null # Compile mode: null, "default", "reduce-overhead", "max-autotune"
+use_cudagraphs: false # Whether to use CUDA graphs (requires static shapes)
+auto_resume: true

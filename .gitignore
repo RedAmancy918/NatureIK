@@ -172,3 +172,14 @@ data_local/
 *.mov
 *.avi
 *.gif
+
+# MIP (much-ado-about-noising) integration
+.ruff_cache/
+mip/uv.lock
+mip/.claude/
+mip/.vscode/
+mip/.github/
+mip/checkpoints/
+mip/tmp/
+mip/cache/
+mip/node_modules/

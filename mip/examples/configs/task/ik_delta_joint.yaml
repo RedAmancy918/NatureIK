@@ -1,0 +1,23 @@
+# @package task
+# NatureIK DeltaJoint mode:
+#   obs = 20D [q_curr(6) + eef_curr(7) + eef_tgt(7)]
+#   action = 6D delta joint angles
+env_name: "ik_delta_joint"
+env_type: "ik"
+obs_type: "state"
+action_type: "delta"
+abs_action: false
+
+# Path to NatureIK dataset root (contains chunk-000/, chunk-001/, ...)
+dataset_path: "/home/user/Data/data/airbot/2026_0322_airbot_ALL_SplitNoRGB/data"
+
+obs_dim: 20           # q_curr(6) + eef_curr(7) + eef_tgt(7)
+act_dim: 6            # delta joint angles (6-DOF arm)
+
+obs_steps: 2          # 2 frames of history → network learns velocity/smoothness
+act_steps: 1          # execute 1 delta_q at a time
+horizon: 1            # predict 1 step: pure IK mapping
+
+max_episode_steps: 300
+num_envs: 1           # no sim env needed; set to 1 as placeholder
+val_dataset_percentage: 0.1

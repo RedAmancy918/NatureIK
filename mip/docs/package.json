@@ -1,0 +1,15 @@
+{
+  "name": "much-ado-about-noising-docs",
+  "version": "0.1.0",
+  "description": "Documentation for Much Ado About Noising: Dispelling the Myths of Generative Robotic Control",
+  "type": "module",
+  "scripts": {
+    "docs:dev": "vitepress dev",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "^2.0.0-alpha.12",
+    "vue": "^3.4.0"
+  }
+}

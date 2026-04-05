@@ -1,0 +1,8 @@
+# @package task
+defaults:
+  - pusht_base
+  - _self_
+
+obs_type: "state"
+
+obs_dim: 5  # [agent_x, agent_y, block_x, block_y, block_angle]

@@ -1,0 +1,22 @@
+# @package task
+# NatureIK Absolute mode (DiT-style):
+#   obs = 7D [eef_pose: xyz + quaternion]
+#   action = 6D absolute joint angles
+env_name: "ik_absolute"
+obs_type: "state"
+action_type: "absolute"
+abs_action: true
+
+# Path to NatureIK dataset root (contains chunk-000/, chunk-001/, ...)
+dataset_path: "/home/user/Data/data/airbot/2026_0322_airbot_ALL_SplitNoRGB/data"
+
+obs_dim: 7            # eef position + quaternion
+act_dim: 6            # absolute joint angles (6-DOF arm)
+
+obs_steps: 1          # single-step IK: no history needed
+act_steps: 1          # predict one action at a time
+horizon: 1            # horizon = 1 for pure IK mapping
+
+max_episode_steps: 300
+num_envs: 1
+val_dataset_percentage: 0.1
