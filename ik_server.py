@@ -471,6 +471,7 @@ def main():
     )
     parser.add_argument(
         "--mip_ckpt",
+        # 加载MIP模型
         default="../much-ado-about-noising/logs/models/model_final_bundle.pt",
         help="MIP checkpoint path (inference bundle saved by train_ik.py)",
     )

@@ -12,6 +12,7 @@ Usage:
 import os
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 import hydra
@@ -180,7 +181,8 @@ def train(
 
     # ---- Checkpoint directory (Hydra changes CWD to outputs/{date}/{time}/) ----
     if checkpoint_dir is None:
-        checkpoint_dir = Path(os.getcwd()) / "checkpoints"
+        run_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        checkpoint_dir = Path(os.getcwd()) / "checkpoints" / run_timestamp
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Checkpoint name suffix: _{network_type}[_{exp_tag}] ----
