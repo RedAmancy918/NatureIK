@@ -14,7 +14,7 @@ t_two_step: 0.9
 discrete_dt: 0.01
 grad_clip_norm: 10.0
 ema_rate: 0.995
-batch_size: 1024 # 1024 for 16GB GPU, 2048 for 32GB GPU
+batch_size: 4096 # 1024 for 16GB GPU, 2048 for 32GB GPU
 gradient_steps: 300000
 warmup_ratio: 0.0
 rampup_ratio: 0.0
