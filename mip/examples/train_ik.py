@@ -3,25 +3,34 @@
 No simulation environment — pure offline imitation learning from Parquet data.
 Validation loss is computed every eval_freq steps using the EMA model (no backward).
 
+FK loss (optional): set task.fk_loss_weight > 0 and provide task.urdf_path /
+task.end_link_name in the task config to enable FK consistency supervision.
+
 Usage:
-    python examples/train_ik.py task=ik_delta_joint
-    python examples/train_ik.py task=ik_absolute
+    python examples/train_ik.py task=ik_delta_joint network=sudeepdit
+    python examples/train_ik.py task=ik_delta_joint_fk network=sudeepdit   # FK loss
     python examples/train_ik.py task=ik_delta_joint network.emb_dim=256 optimization.batch_size=512
 """
 
 import os
 import time
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 
 import hydra
 import loguru
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
+
+try:
+    import pytorch_kinematics as pk
+    HAS_PK = True
+except ImportError:
+    HAS_PK = False
 
 from mip.agent import TrainingAgent
 from mip.config import Config
@@ -32,6 +41,77 @@ from mip.scheduler import WarmupAnnealingScheduler
 from mip.torch_utils import limit_threads, set_seed
 
 torch.set_float32_matmul_precision("high")
+
+
+# ---------------------------------------------------------------------------
+# FK utilities (only used when fk_loss_weight > 0)
+# ---------------------------------------------------------------------------
+
+def quat_xyzw_to_rotmat(q: torch.Tensor) -> torch.Tensor:
+    """(..., 4) xyzw → (..., 3, 3)"""
+    x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    R = torch.stack([
+        1 - 2*(y*y + z*z),  2*(x*y - z*w),      2*(x*z + y*w),
+        2*(x*y + z*w),      1 - 2*(x*x + z*z),  2*(y*z - x*w),
+        2*(x*z - y*w),      2*(y*z + x*w),      1 - 2*(x*x + y*y),
+    ], dim=-1)
+    return R.reshape(*q.shape[:-1], 3, 3)
+
+
+def geodesic_loss(R_pred: torch.Tensor, R_tgt: torch.Tensor) -> torch.Tensor:
+    """Mean geodesic distance (radians) between two batches of rotation matrices."""
+    R_diff = R_pred.transpose(-1, -2) @ R_tgt
+    trace  = R_diff[..., 0, 0] + R_diff[..., 1, 1] + R_diff[..., 2, 2]
+    cos_a  = ((trace - 1) / 2).clamp(-1 + 1e-6, 1 - 1e-6)
+    return torch.acos(cos_a).mean()
+
+
+def build_fk_chain(urdf_path: str, end_link_name: str, device: str):
+    """Load URDF and build a differentiable pytorch_kinematics serial chain."""
+    with open(urdf_path, "r") as f:
+        urdf_str = f.read()
+    chain = pk.build_serial_chain_from_urdf(urdf_str, end_link_name)
+    return chain.to(device=device, dtype=torch.float32)
+
+
+def compute_fk_loss(
+    flow_map, encoder, obs, act, delta_t, batch,
+    fk_chain, act_range, act_min, fk_pos_weight, fk_rot_weight,
+) -> torch.Tensor:
+    """FK consistency loss — separate forward pass, fully differentiable.
+
+    1. Sample interpolation x_s between noise x_0 and GT action x_1.
+    2. Euler-extrapolate via flow_map to get predicted x_1.
+    3. Unnormalize → delta_q_pred; compute q_next = q_curr + delta_q_pred.
+    4. FK(q_next) → pos/rot; compare with eef_tgt from batch.
+    """
+    B, Ta, act_dim = act.shape
+    device = act.device
+
+    s     = torch.rand(B, device=device)
+    x_0   = torch.randn_like(act)
+    s_exp = s.view(B, 1, 1)
+    x_s   = (1 - s_exp) * x_0 + s_exp * act          # interpolate toward GT
+
+    cond     = encoder(obs)
+    t_ones   = torch.ones(B, device=device)
+    x_1_pred = flow_map(s, t_ones, x_s, cond)         # Euler step to t=1
+
+    # Differentiable unnormalize: [-1,1] → raw delta_q
+    delta_q_pred = (x_1_pred + 1) / 2 * act_range + act_min   # (B, Ta, 6)
+
+    q_pred = batch["q_curr_raw"].to(device) + delta_q_pred     # (B, Ta, 6)
+    tf     = fk_chain.forward_kinematics(q_pred.reshape(-1, act_dim))
+    mat    = tf.get_matrix()                                    # (B*Ta, 4, 4)
+    pos_pred = mat[:, :3, 3].reshape(B, Ta, 3)
+    rot_pred = mat[:, :3, :3].reshape(B, Ta, 3, 3)
+
+    eef_tgt  = batch["eef_tgt_raw"].to(device)                 # (B, Ta, 7)
+    pos_tgt  = eef_tgt[..., :3]
+    rot_tgt  = quat_xyzw_to_rotmat(eef_tgt[..., 3:7].reshape(-1, 4)).reshape(B, Ta, 3, 3)
+
+    return fk_pos_weight * F.mse_loss(pos_pred, pos_tgt) \
+         + fk_rot_weight * geodesic_loss(rot_pred, rot_tgt)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +225,30 @@ def train(
 ):
     device = config.optimization.device
 
+    # ---- FK loss setup (disabled when fk_loss_weight == 0) ----
+    fk_loss_weight = float(getattr(config.task, "fk_loss_weight", 0.0))
+    fk_pos_weight  = float(getattr(config.task, "fk_pos_weight",  1.0))
+    fk_rot_weight  = float(getattr(config.task, "fk_rot_weight",  0.1))
+    fk_chain = act_range = act_min_t = None
+
+    if fk_loss_weight > 0:
+        if not HAS_PK:
+            loguru.logger.warning("fk_loss_weight > 0 but pytorch_kinematics not installed — FK loss skipped.")
+        else:
+            urdf_path     = getattr(config.task, "urdf_path",     None)
+            end_link_name = getattr(config.task, "end_link_name", None)
+            if urdf_path and end_link_name:
+                fk_chain = build_fk_chain(urdf_path, end_link_name, device)
+                act_norm_obj = normalizer["action"]
+                act_range = torch.tensor(act_norm_obj.range, dtype=torch.float32, device=device)
+                act_min_t = torch.tensor(act_norm_obj.min,   dtype=torch.float32, device=device)
+                loguru.logger.info(
+                    f"FK loss enabled | weight={fk_loss_weight} "
+                    f"pos_w={fk_pos_weight} rot_w={fk_rot_weight} end_link={end_link_name}"
+                )
+            else:
+                loguru.logger.warning("fk_loss_weight > 0 but urdf_path/end_link_name not set — FK loss skipped.")
+
     # ---- DataLoaders ----
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -181,8 +285,7 @@ def train(
 
     # ---- Checkpoint directory (Hydra changes CWD to outputs/{date}/{time}/) ----
     if checkpoint_dir is None:
-        run_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        checkpoint_dir = Path(os.getcwd()) / "checkpoints" / run_timestamp
+        checkpoint_dir = Path(os.getcwd()) / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- Checkpoint name suffix: _{network_type}[_{exp_tag}] ----
@@ -226,7 +329,7 @@ def train(
                 act = batch["action"].to(device)
                 act = act[:, : config.task.horizon, :]     # (B, Ta, act_dim)
 
-            # ---- Update ----
+            # ---- Update (flow matching) ----
             with timed("update", perf_times):
                 delta_t_scalar = warmup_scheduler(step)
                 B = act.shape[0]
@@ -234,9 +337,26 @@ def train(
                 info = agent.update(act, obs, delta_t)
                 lr_scheduler.step()
 
+            # ---- FK loss (separate forward + backward, skipped when fk_chain is None) ----
+            fk_loss_val = 0.0
+            if fk_chain is not None:
+                agent.optimizer.zero_grad()
+                fk_loss = compute_fk_loss(
+                    agent.flow_map, agent.encoder, obs, act, delta_t, batch,
+                    fk_chain, act_range, act_min_t, fk_pos_weight, fk_rot_weight,
+                )
+                (fk_loss_weight * fk_loss).backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(agent.encoder.parameters()) + list(agent.flow_map.parameters()),
+                    config.optimization.grad_clip_norm,
+                )
+                agent.optimizer.step()
+                fk_loss_val = fk_loss.item()
+
             for k, v in info.items():
                 if isinstance(v, torch.Tensor):
                     info[k] = v.item()
+            info["fk_loss"] = fk_loss_val
             info_list.append(info)
 
         # ---- Train logging ----  category must be "train" or "eval"
@@ -258,9 +378,12 @@ def train(
             metrics["perf/update_ms"]     = np.mean(perf_times["update"][-freq:])     * 1000
             metrics["perf/steps_per_sec"] = 1.0 / np.mean(perf_times["total_step"][-freq:])
             run_logger.log(metrics, category="train")
-            # Update progress bar with latest loss
             loss_val = metrics.get("loss", float("nan"))
-            pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{metrics['lr']:.2e}", step=step + 1)
+            fk_disp  = metrics.get("fk_loss", 0.0)
+            postfix  = {"loss": f"{loss_val:.4f}", "lr": f"{metrics['lr']:.2e}", "step": step + 1}
+            if fk_chain is not None:
+                postfix["fk"] = f"{fk_disp:.4f}"
+            pbar.set_postfix(**postfix)
             info_list = []
 
         # ---- Validation + Best-model checkpoint ----

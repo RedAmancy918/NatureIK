@@ -1,0 +1,40 @@
+# @package task
+# NatureIK DeltaJoint + FK Loss mode:
+#   obs = 20D [q_curr(6) + eef_curr(7) + eef_tgt(7)]
+#   action = 6D delta joint angles
+#   extra: FK consistency loss via pytorch_kinematics
+env_name: "ik_delta_joint"
+obs_type: "state"
+env_type: "ik"
+action_type: "delta"
+abs_action: false
+
+# Path to NatureIK dataset root (contains chunk-000/, chunk-001/, ...)
+dataset_path: "/home/user/Data/data/airbot/2026_0322_airbot_ALL_SplitNoRGB/data"
+
+obs_dim: 20           # q_curr(6) + eef_curr(7) + eef_tgt(7)
+act_dim: 6            # delta joint angles (6-DOF arm)
+
+# config 1：2026-04-03 实验参数
+# obs_steps: 2          # how many obs timesteps fed to encoder
+# act_steps: 1          # action chunk length to execute
+# horizon: 1            # prediction horizon (= act_steps for pure action pred)
+
+# config 2：2026-04-05 实验参数
+obs_steps: 4          # how many obs timesteps fed to encoder
+act_steps: 1          # action chunk length to execute
+horizon: 3            # prediction horizon (= act_steps for pure action pred)
+
+max_episode_steps: 300
+num_envs: 1           # no sim env needed; set to 1 as placeholder
+val_dataset_percentage: 0.1
+
+# FK loss configuration
+# urdf_path: path to robot URDF file for pytorch_kinematics
+# end_link_name: name of the end-effector link in the URDF
+urdf_path: "/home/user/yjh/diffusion_policy/diffusion_policy/urdf_data/play_g2_usb_cam/urdf/play_g2_usb_cam.urdf"
+end_link_name: "link6"
+fk_loss_weight: 0.1   # weight of FK loss relative to flow matching loss
+fk_pos_weight: 1.0    # weight of position term within FK loss
+fk_rot_weight: 0.1    # weight of rotation term within FK loss (radians vs meters)
+

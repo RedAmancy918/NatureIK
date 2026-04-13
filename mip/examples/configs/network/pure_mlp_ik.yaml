@@ -1,0 +1,11 @@
+# @package network
+defaults:
+  - _base
+  - _self_
+
+network_type: "pure_mlp_ik"
+hidden_dims: [1024, 1024, 512]
+dropout: 0.1
+activation: "gelu"
+use_layernorm: false
+

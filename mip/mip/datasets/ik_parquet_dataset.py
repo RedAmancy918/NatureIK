@@ -308,12 +308,24 @@ class IKParquetDataset(BaseDataset):
 
     def __getitem__(self, idx: int) -> dict:
         ep_idx, t = self._index[idx]
-        obs, act = self._get_window(self._episodes[ep_idx], t)
+        ep = self._episodes[ep_idx]
+        obs, act = self._get_window(ep, t)
 
         obs_norm = self._normalizer["obs"]["state"].normalize(obs)  # (H, obs_dim)
         act_norm = self._normalizer["action"].normalize(act)         # (H, act_dim)
 
-        return {
+        result = {
             "obs":    {"state": torch.from_numpy(obs_norm)},  # (obs_steps, obs_dim)
             "action": torch.from_numpy(act_norm),              # (horizon,   act_dim)
         }
+
+        # Raw (unnormalized) fields for FK loss — only in delta_joint mode.
+        # train_ik.py uses these when fk_loss_weight > 0; otherwise ignored.
+        if self.mode == "delta_joint":
+            act_start = t + self.obs_steps - 1
+            q_curr_raw  = ep["q_curr"][act_start : act_start + self.horizon]
+            eef_tgt_raw = ep.get("eef_tgt", ep["eef_curr"])[act_start : act_start + self.horizon]
+            result["q_curr_raw"]  = torch.from_numpy(q_curr_raw.astype(np.float32))   # (Ta, 6)
+            result["eef_tgt_raw"] = torch.from_numpy(eef_tgt_raw.astype(np.float32))  # (Ta, 7)
+
+        return result

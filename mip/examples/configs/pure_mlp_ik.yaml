@@ -1,0 +1,24 @@
+defaults:
+  - log: default
+  - optimization: default
+  - network: pure_mlp_ik
+  - task: ik_delta_joint
+  - launcher: basic
+  - _self_
+
+mode: "train"
+
+optimization:
+  lr: 3e-4
+  weight_decay: 1e-5
+  batch_size: 2048
+  gradient_steps: 200000
+  norm_type: "smooth_l1"
+  device: "cuda"
+  train_num_workers: 4
+  val_num_workers: 2
+
+log:
+  project: "mip_ik_baselines"
+  group: "pure_mlp_ik"
+  exp_name: "${task.env_name}_${task.env_type}_${task.obs_type}_${network.network_type}_seed${optimization.seed}"
