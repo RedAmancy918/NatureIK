@@ -13,8 +13,8 @@ fuse.cfg
 
 *.ai
 
-# Generation results
-results/
+# Generation results (only top-level; experiments/results/ should be tracked)
+/results/
 
 ray/auth.json
 
@@ -183,3 +183,21 @@ mip/checkpoints/
 mip/tmp/
 mip/cache/
 mip/node_modules/
+
+# Experiment checkpoints — model weights (large files)
+# Individual *.pt / *.ckpt files are already ignored above.
+# Explicitly list the whole subtree for clarity.
+experiments/checkpoints/
+
+# NCF raw sensor data & processed point clouds (large files)
+# Top-level 'data' entry above already covers these; listed explicitly for clarity.
+data/ncf_raw/
+data/ncf_processed/
+
+# Paper videos (large files already covered by *.mp4 / *.mov above)
+paper/videos/
+
+# Tracked (do NOT ignore):
+#   experiments/configs/     — ablation config files
+#   experiments/results/     — evaluation CSVs (small, useful for paper)
+#   experiments/registry.csv — experiment log

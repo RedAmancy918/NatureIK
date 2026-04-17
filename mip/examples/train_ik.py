@@ -12,6 +12,7 @@ Usage:
     python examples/train_ik.py task=ik_delta_joint network.emb_dim=256 optimization.batch_size=512
 """
 
+import csv
 import os
 import time
 from contextlib import contextmanager
@@ -284,18 +285,26 @@ def train(
         max_value=config.optimization.max_value,
     )
 
-    # ---- Checkpoint directory (Hydra changes CWD to outputs/{date}/{time}/) ----
+    # ---- Checkpoint directory ----
+    # Normally constructed in main() and passed in.
+    # This fallback handles direct / programmatic calls to train().
     if checkpoint_dir is None:
-        run_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        checkpoint_dir = Path(os.getcwd()) / "checkpoints" / run_timestamp
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        run_timestamp  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_dir        = Path(os.path.expanduser(config.log.log_dir))
+        group          = getattr(config.log, "group",    "ungrouped")
+        exp_name_cfg   = getattr(config.log, "exp_name", config.task.env_name)
+        exp_tag_cfg    = getattr(config.log, "exp_tag",  "seed0") or "seed0"
+        checkpoint_dir = log_dir / "checkpoints" / group / exp_name_cfg / exp_tag_cfg / run_timestamp
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # Save config snapshot when falling back (main() saves it otherwise)
+        OmegaConf.save(config, checkpoint_dir / "config.yaml")
+    else:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Checkpoint name suffix: _{network_type}[_{exp_tag}] ----
+    # ---- Checkpoint name suffix: _{network_type} ----
+    # exp_tag is already encoded in the directory path; no need to repeat it in filenames.
     network_type = getattr(config.network, "network_type", "")
-    exp_tag      = getattr(config.log,     "exp_tag",      "") or ""
     ckpt_suffix  = f"_{network_type}" if network_type else ""
-    if exp_tag:
-        ckpt_suffix += f"_{exp_tag}"
 
     loguru.logger.info(
         f"Checkpoints will be saved to: {checkpoint_dir}  (suffix: '{ckpt_suffix}')"
@@ -439,6 +448,50 @@ def train(
     else:
         agent.save(checkpoint_dir / final_name)
     loguru.logger.info(f"Training complete → {final_name}")
+    return best_val_loss
+
+
+# ---------------------------------------------------------------------------
+# Experiment registry helper
+# ---------------------------------------------------------------------------
+
+def _update_registry(
+    registry_path: Path,
+    group: str,
+    exp_name: str,
+    exp_tag: str,
+    steps: int,
+    val_loss: float,
+    ckpt_dir: str,
+    fk_weight: float = 0.0,
+    notes: str = "",
+) -> None:
+    """Append a completed-run record to experiments/registry.csv.
+
+    Columns: group, exp_name, seed_tag, 状态, 训练步数, val_loss,
+             位置误差_mm, 姿态误差_deg, 碰撞率_%, checkpoint路径, 备注
+
+    The last three metric columns are left blank here and filled later
+    by eval_ik.py after real-robot / simulation evaluation.
+    """
+    header = [
+        "group", "exp_name", "seed_tag", "状态", "训练步数",
+        "val_loss", "位置误差_mm", "姿态误差_deg", "碰撞率_%",
+        "checkpoint路径", "备注",
+    ]
+    write_header = not registry_path.exists()
+    with open(registry_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(header)
+        writer.writerow([
+            group, exp_name, exp_tag, "完成",
+            steps, f"{val_loss:.6f}",
+            "", "", "",          # pos_err / ori_err / collision_rate — filled by eval_ik.py
+            ckpt_dir,
+            f"fk_weight={fk_weight} | {notes}",
+        ])
+    loguru.logger.info(f"Registry updated → {registry_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -452,8 +505,28 @@ def main(cfg):
 
     limit_threads(1)
     set_seed(config.optimization.seed)
-    os.makedirs(config.log.log_dir, exist_ok=True)
 
+    # ---- Resolve experiment identity from log config ----
+    group    = getattr(config.log, "group",    "ungrouped")
+    exp_name = getattr(config.log, "exp_name", config.task.env_name)
+    exp_tag  = getattr(config.log, "exp_tag",  "seed0") or "seed0"
+    log_dir  = Path(os.path.expanduser(config.log.log_dir))
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Build checkpoint directory: log_dir/checkpoints/{group}/{exp_name}/{exp_tag}/{ts} ----
+    run_timestamp  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    checkpoint_dir = log_dir / "checkpoints" / group / exp_name / exp_tag / run_timestamp
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Save full config snapshot beside the checkpoints ----
+    # This is the single source of truth for reproducing a run.
+    config_snapshot_path = checkpoint_dir / "config.yaml"
+    OmegaConf.save(cfg, config_snapshot_path)
+    loguru.logger.info(f"Config snapshot → {config_snapshot_path}")
+
+    loguru.logger.info(
+        f"Experiment: group={group} | exp_name={exp_name} | exp_tag={exp_tag}"
+    )
     loguru.logger.info(f"Task:   {config.task.env_name}")
     loguru.logger.info(f"Device: {config.optimization.device}")
 
@@ -480,7 +553,24 @@ def main(cfg):
     agent      = TrainingAgent(config)
     run_logger = Logger(config)
 
-    train(config, dataset, val_dataset, agent, run_logger, normalizer=dataset._normalizer)
+    best_val_loss = train(
+        config, dataset, val_dataset, agent, run_logger,
+        checkpoint_dir=checkpoint_dir,
+        normalizer=dataset._normalizer,
+    )
+
+    # ---- Append run record to experiments/registry.csv ----
+    _update_registry(
+        registry_path=log_dir / "registry.csv",
+        group=group,
+        exp_name=exp_name,
+        exp_tag=exp_tag,
+        steps=config.optimization.gradient_steps,
+        val_loss=best_val_loss if best_val_loss != float("inf") else float("nan"),
+        ckpt_dir=str(checkpoint_dir),
+        fk_weight=float(getattr(config.task, "fk_loss_weight", 0.0)),
+        notes=f"network={getattr(config.network, 'network_type', 'unknown')}",
+    )
 
 
 if __name__ == "__main__":

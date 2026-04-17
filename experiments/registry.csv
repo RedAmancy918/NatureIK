@@ -1,0 +1,1 @@
+group,exp_name,seed_tag,状态,训练步数,val_loss,位置误差_mm,姿态误差_deg,碰撞率_%,checkpoint路径,备注

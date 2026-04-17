@@ -3,6 +3,7 @@ defaults:
   - _self_
 
 log_dir: "."
+# log_dir: "/home/user/yjh/diffusion_policy/diffusion_policy/experiments"
 wandb_mode: "online"
 project: "mip"
 group: "default"
