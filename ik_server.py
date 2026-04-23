@@ -38,6 +38,8 @@ try:
     from diffusion_policy.workspace.base_workspace import BaseWorkspace
     from diffusion_policy.dataset.robot_feature_utils import build_robot_feature_map
     from diffusion_policy.dataset.robot_specs import ROBOT_SPECS
+    from diffusion_policy.model.differentiable_ik_model import DifferentiableIKHelper, TTGLoss
+    from diffusion_policy.gym_util.guidance_utils_ik import guided_inference
 except ImportError as e:
     cprint(f"[!] NatureIK 核心库未安装: {e}", "red")
 
@@ -120,6 +122,9 @@ def _align_quaternions(p: np.ndarray):
 class MIPIKSolver(BaseIKSolver):
     """基于 MIP（流匹配）模型的 IK 求解器。
 
+    支持可选的测试时梯度投影（TTG Projection）：
+        MIP 2步确定性推理 → delta_q → FK梯度投影（L_pose + L_hist + L_smooth）→ delta_q_refined
+
     从 train_ik.py 保存的推理包中加载：
         flow_map / encoder / *_ema 权重
         config  （OmegaConf 容器 → 重建 TrainingAgent）
@@ -130,7 +135,18 @@ class MIPIKSolver(BaseIKSolver):
         内部维护一个滚动 buffer；首次调用时用第一帧重复填充 buffer（冷启动）。
     """
 
-    def __init__(self, ckpt: str):
+    def __init__(
+        self,
+        ckpt: str,
+        urdf_path: str | None = None,          # 提供时启用 TTG 梯度投影
+        ee_link: str = "link_eef",
+        use_ttg: bool = False,                  # 是否启用梯度投影
+        ttg_lr: float = 0.02,                   # 投影步长
+        ttg_steps: int = 5,                     # 投影迭代次数
+        ttg_lambda_pose: float = 1.0,
+        ttg_lambda_hist: float = 0.3,
+        ttg_lambda_smooth: float = 0.05,
+    ):
         if not HAS_MIP:
             raise RuntimeError("MIP library not available. Check sys.path.")
 
@@ -170,9 +186,31 @@ class MIPIKSolver(BaseIKSolver):
         self.act_dim   = int(config.task.act_dim)    # 动作维度（delta_joint = 6）
 
         # 左右臂独立历史 buffer：各自保留最近 obs_steps 帧，互不干扰
-        # 注意：不能共用一个 deque，否则双臂调用时会互相污染历史
-        self._history_l: deque = deque(maxlen=self.obs_steps)  # 左臂专用
-        self._history_r: deque = deque(maxlen=self.obs_steps)  # 右臂专用
+        self._history_l: deque = deque(maxlen=self.obs_steps)
+        self._history_r: deque = deque(maxlen=self.obs_steps)
+
+        # 上一步 delta_q，用于 L_hist（左右臂独立）
+        self._dq_prev_l: np.ndarray | None = None
+        self._dq_prev_r: np.ndarray | None = None
+
+        # ── TTG 梯度投影初始化 ────────────────────────────────────────────────
+        self.use_ttg  = use_ttg and (urdf_path is not None)
+        self.ttg_lr   = ttg_lr
+        self.ttg_steps = ttg_steps
+        self.ik_helper = None
+        self.ttg_loss  = None
+        if self.use_ttg:
+            self.ik_helper = DifferentiableIKHelper(
+                urdf_path=urdf_path,
+                end_effector_link_name=ee_link,
+                device=str(self.device),
+            )
+            self.ttg_loss = TTGLoss(
+                lambda_pose=ttg_lambda_pose,
+                lambda_hist=ttg_lambda_hist,
+                lambda_smooth=ttg_lambda_smooth,
+            )
+            cprint(f"[*] MIP TTG 梯度投影已启用 (lr={ttg_lr}, steps={ttg_steps})", "cyan")
 
         cprint(
             f"[*] MIP IK Solver loaded | obs_steps={self.obs_steps} "
@@ -196,34 +234,87 @@ class MIPIKSolver(BaseIKSolver):
         et = _align_quaternions(ee_target)[:7]  # 目标末端：xyz + quat（已对齐）
         return np.concatenate([q_curr[:6], ec, et], axis=-1).astype(np.float32)
 
-    def _infer_with_buf(self, buf: deque, frame: np.ndarray) -> np.ndarray:
-        """向指定 buffer 追加当前帧，并执行一次 MIP 推理，返回 delta_q (6,)。
-
-        冷启动时 buffer 为空，用当前帧重复填充至 obs_steps 帧。
-        正常运行时追加当前帧，deque 自动淘汰最旧帧。
-        """
+    def _infer_with_buf(
+        self,
+        buf: deque,
+        frame: np.ndarray,
+        q_curr: np.ndarray,
+        ee_target: np.ndarray,
+        dq_prev: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """MIP 推理 + 可选 TTG 梯度投影，返回 delta_q (6,)。"""
+        # ── 历史 buffer 更新 ──────────────────────────────────────────────────
         if len(buf) == 0:
-            # 冷启动：首帧重复填充，保证 buffer 始终有 obs_steps 帧
             for _ in range(self.obs_steps):
                 buf.append(frame.copy())
         else:
-            # 正常运行：追加当前帧，最旧帧被自动淘汰
             buf.append(frame)
 
-        # 堆叠为 (obs_steps, obs_dim)，归一化 → tensor (1, obs_steps, obs_dim)
-        obs_np   = np.stack(list(buf), axis=0)              # (To, 20)
-        obs_norm = self._norm_obs.normalize(obs_np)          # (To, 20)，逐维线性缩放
+        obs_np   = np.stack(list(buf), axis=0)
+        obs_norm = self._norm_obs.normalize(obs_np)
         obs_t    = torch.from_numpy(obs_norm).float().unsqueeze(0).to(self.device)
 
-        # MIP 流匹配推理（2步：零初始化 → 粗估 → 精修）
+        # ── MIP 2步确定性推理 ─────────────────────────────────────────────────
         act_0 = torch.zeros(1, self.horizon, self.act_dim, device=self.device)
         with torch.no_grad():
             act_norm_t = self.agent.sample(act_0=act_0, obs=obs_t, num_steps=2, use_ema=True)
 
-        # 反归一化，取预测窗口第 0 帧作为本次输出
-        act_norm_np = act_norm_t.cpu().numpy()[0, 0]                        # (act_dim,)
-        delta_q = self._norm_action.unnormalize(act_norm_np[np.newaxis])[0] # (6,)
+        act_norm_np = act_norm_t.cpu().numpy()[0, 0]
+        delta_q     = self._norm_action.unnormalize(act_norm_np[np.newaxis])[0]  # (6,)
+
+        # ── TTG 梯度投影（可选）──────────────────────────────────────────────
+        if self.use_ttg and self.ik_helper is not None:
+            delta_q = self._ttg_projection(
+                delta_q    = delta_q,
+                q_curr     = q_curr,
+                ee_target  = ee_target,
+                dq_prev    = dq_prev,
+            )
+
         return delta_q
+
+    def _ttg_projection(
+        self,
+        delta_q: np.ndarray,           # MIP 输出的 delta_q (6,)
+        q_curr: np.ndarray,            # 当前关节角 (6,)
+        ee_target: np.ndarray,         # 目标末端位姿 (7,) xyz+quat
+        dq_prev: np.ndarray | None,    # 上一步 delta_q，用于 L_hist
+    ) -> np.ndarray:
+        """在 MIP 输出上做 FK 梯度投影，修正几何误差，保留风格。
+
+        优化变量是 delta_q（而非关节角本身），保证修正量最小。
+        """
+        device = self.device
+        dq = torch.from_numpy(delta_q).float().to(device).unsqueeze(0)   # (1, 6)
+        q  = torch.from_numpy(q_curr[:6]).float().to(device).unsqueeze(0) # (1, 6)
+        target_pos = torch.from_numpy(ee_target[:3]).float().to(device).unsqueeze(0)  # (1, 3)
+
+        dq_prev_t = None
+        if dq_prev is not None:
+            dq_prev_t = torch.from_numpy(dq_prev).float().to(device).unsqueeze(0)
+
+        dq = dq.requires_grad_(True)
+        for _ in range(self.ttg_steps):
+            q_pred = q + dq                                               # (1, 6)
+            curr_pos, curr_rot = self.ik_helper.get_current_pose(q_pred)
+
+            loss = self.ttg_loss.compute(
+                curr_pos   = curr_pos,
+                curr_rot   = curr_rot,
+                target_pos = target_pos,
+                dq_pred    = dq,
+                dq_prev    = dq_prev_t,
+            )
+            if loss.item() < 1e-6:
+                break
+            grad = torch.autograd.grad(loss, dq)[0]
+            # 梯度裁剪：防止奇异点附近梯度爆炸导致 dq 被推离正常范围
+            grad_norm = grad.norm()
+            if grad_norm > 1.0:
+                grad = grad / grad_norm
+            dq   = (dq - self.ttg_lr * grad).detach().requires_grad_(True)
+
+        return dq.detach().squeeze(0).cpu().numpy()
 
     def solve_arm(
         self,
@@ -231,28 +322,41 @@ class MIPIKSolver(BaseIKSolver):
         ee_curr: np.ndarray,
         ee_target: np.ndarray,
     ) -> np.ndarray:
-        """单臂推理：使用左臂 buffer（单独调用场景）。"""
-        frame = self._make_obs_frame(q_curr, ee_curr, ee_target)
-        return self._infer_with_buf(self._history_l, frame)
+        """单臂推理：使用左臂 buffer。"""
+        frame  = self._make_obs_frame(q_curr, ee_curr, ee_target)
+        dq     = self._infer_with_buf(
+            self._history_l, frame, q_curr, ee_target, self._dq_prev_l
+        )
+        self._dq_prev_l = dq.copy()
+        return dq
 
     def solve_dual_arm(
         self,
         q_l: np.ndarray, ee_l: np.ndarray, et_l: np.ndarray,
         q_r: np.ndarray, ee_r: np.ndarray, et_r: np.ndarray,
     ):
-        """双臂推理：左右臂各用独立 buffer，历史帧互不干扰。
-
-        不能复用基类的顺序调用（那会让两臂共享同一个 deque，
-        导致 buffer 里左右帧交替出现，历史完全错乱）。
-        """
+        """双臂推理：左右臂各用独立 buffer 和独立 dq_prev。"""
         frame_l = self._make_obs_frame(q_l, ee_l, et_l)
         frame_r = self._make_obs_frame(q_r, ee_r, et_r)
-        dq_l = self._infer_with_buf(self._history_l, frame_l)
-        dq_r = self._infer_with_buf(self._history_r, frame_r)
+        dq_l = self._infer_with_buf(self._history_l, frame_l, q_l, et_l, self._dq_prev_l)
+        dq_r = self._infer_with_buf(self._history_r, frame_r, q_r, et_r, self._dq_prev_r)
+        self._dq_prev_l = dq_l.copy()
+        self._dq_prev_r = dq_r.copy()
         return dq_l, dq_r
 
 class NatureIKSolver(BaseIKSolver):
-    def __init__(self, ckpt, robot_name):
+    def __init__(
+        self,
+        ckpt,
+        robot_name,
+        urdf_path: str | None = None,         # 提供时启用 TTG
+        ee_link: str = "link_eef",
+        use_ttg: bool = False,                 # 是否启用 Diffusion TTG
+        guidance_scale: float = 10.0,
+        ttg_lambda_pose: float = 1.0,
+        ttg_lambda_hist: float = 0.3,
+        ttg_lambda_smooth: float = 0.05,
+    ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         payload = torch.load(open(ckpt, "rb"), pickle_module=__import__("dill"))
         self.cfg = payload["cfg"]
@@ -266,59 +370,113 @@ class NatureIKSolver(BaseIKSolver):
         # TensorRT 级编译优化
         try:
             cprint("[*] 正在为 NatureIK 开启 TensorRT 级编译优化...", "yellow")
-            # 使用 reduce-overhead 模式，针对小 Batch 循环推理最有效
             self.policy = torch.compile(self.policy, mode="reduce-overhead")
-            # 预热一次，防止第一次请求时卡顿
             dummy_obs = torch.randn(2, self.policy.n_obs_steps, 20).to(self.device)
             with torch.no_grad():
                 _ = self.policy.predict_action({"obs": dummy_obs})
             cprint("[*] NatureIK 编译预热完成！", "green")
         except Exception as e:
             cprint(f"[!] 编译失败（版本或环境不支持）: {e}", "red")
-            
+
         self.robot_feature = None
         if self.cfg.task.dataset.get("use_robot_feature", False):
             f_map = build_robot_feature_map(ROBOT_SPECS, max_joints=16)
             self.robot_feature = f_map[robot_name].astype(np.float32)
+
+        # ── TTG 初始化 ────────────────────────────────────────────────────────
+        self.use_ttg       = use_ttg and (urdf_path is not None)
+        self.guidance_scale = guidance_scale
+        self.ik_helper     = None
+        self.ttg_loss      = None
+        if self.use_ttg:
+            self.ik_helper = DifferentiableIKHelper(
+                urdf_path=urdf_path,
+                end_effector_link_name=ee_link,
+                device=str(self.device),
+            )
+            self.ttg_loss = TTGLoss(
+                lambda_pose=ttg_lambda_pose,
+                lambda_hist=ttg_lambda_hist,
+                lambda_smooth=ttg_lambda_smooth,
+            )
+            cprint(f"[*] NatureIK TTG 已启用 (scale={guidance_scale})", "cyan")
+
+        # 左右臂各自维护上一步 delta_q，用于 L_hist
+        self._dq_prev_l: np.ndarray | None = None
+        self._dq_prev_r: np.ndarray | None = None
+
         cprint(f"[*] NatureIK (ResNet) 加载成功", "magenta")
 
-    def solve_arm(self, q_curr, ee_curr, ee_target):
-        ec = _align_quaternions(ee_curr)[:7]
-        et = _align_quaternions(ee_target)[:7]
-        obs = np.concatenate([q_curr[:6], ec, et], axis=-1)
+    def _build_obs(self, q, ee, et):
+        ec  = _align_quaternions(ee)[:7]
+        et_ = _align_quaternions(et)[:7]
+        obs = np.concatenate([q[:6], ec, et_], axis=-1)
         if self.robot_feature is not None:
             obs = np.concatenate([obs, self.robot_feature], axis=-1)
+        return obs
 
-        # 模型期望 (B, n_obs_steps, D)，当前只有单帧，重复补齐
-        n_obs = self.policy.n_obs_steps
+    def _predict(self, obs_ts, ee_target_t, dq_prev_t):
+        """统一推理入口：有 TTG 时走 guided_inference，否则走 predict_action。"""
+        if self.use_ttg and self.ik_helper is not None:
+            target_pos = torch.from_numpy(ee_target_t[:, :3]).float().to(self.device)
+            target_pose_dict = {"pos": target_pos}
+            action_stats = getattr(self.policy.normalizer, "action_stats", None) \
+                           or self.policy.normalizer["action"].stats
+            action = guided_inference(
+                policy           = self.policy,
+                obs_dict         = {"obs": obs_ts},
+                ik_helper        = self.ik_helper,
+                target_pose_dict = target_pose_dict,
+                action_stats     = action_stats,
+                guidance_scale   = self.guidance_scale,
+                dq_prev          = dq_prev_t,
+                ttg_loss         = self.ttg_loss,
+                device           = str(self.device),
+            )
+            return action[:, 0, :].cpu().numpy()   # (B, act_dim)
+        else:
+            with torch.no_grad():
+                res = self.policy.predict_action({"obs": obs_ts})
+            actions = res["action_pred"].cpu().numpy()
+            if actions.ndim == 3:
+                actions = actions[:, 0, :]
+            return actions                          # (B, act_dim)
+
+    def solve_arm(self, q_curr, ee_curr, ee_target):
+        obs    = self._build_obs(q_curr, ee_curr, ee_target)
+        n_obs  = self.policy.n_obs_steps
         obs_ts = torch.from_numpy(obs).float().to(self.device)
-        obs_ts = obs_ts.unsqueeze(0).unsqueeze(0).repeat(1, n_obs, 1)  # (1, n_obs, D)
+        obs_ts = obs_ts.unsqueeze(0).unsqueeze(0).repeat(1, n_obs, 1)   # (1, n_obs, D)
 
-        with torch.no_grad():
-            res = self.policy.predict_action({"obs": obs_ts})
-            # pred_action_steps_only=True 时 action_pred shape: (B, n_action_steps, 6)
-            return res["action_pred"].cpu().numpy()[0, 0]
-            #双臂推理接口实现
+        et_t      = torch.from_numpy(ee_target[:7]).float().unsqueeze(0).to(self.device)  # (1,7)
+        dq_prev_t = None
+        if self._dq_prev_l is not None:
+            dq_prev_t = torch.from_numpy(self._dq_prev_l).float().unsqueeze(0).to(self.device)
+
+        result         = self._predict(obs_ts, et_t.cpu().numpy(), dq_prev_t)
+        dq             = result[0]                 # (act_dim,)
+        self._dq_prev_l = dq.copy()
+        return dq
+
     def solve_dual_arm(self, q_l, ee_l, et_l, q_r, ee_r, et_r):
-        def _build(q, ee, et):
-            ec = _align_quaternions(ee)[:7]
-            et_ = _align_quaternions(et)[:7]
-            obs = np.concatenate([q[:6], ec, et_], axis=-1)
-            if self.robot_feature is not None:
-                obs = np.concatenate([obs, self.robot_feature], axis=-1)
-            return obs
+        obs_l = self._build_obs(q_l, ee_l, et_l)
+        obs_r = self._build_obs(q_r, ee_r, et_r)
+        obs_batch = np.stack([obs_l, obs_r], axis=0)                     # (2, D)
+        n_obs  = self.policy.n_obs_steps
+        obs_ts = torch.from_numpy(obs_batch).float().to(self.device)
+        obs_ts = obs_ts.unsqueeze(1).repeat(1, n_obs, 1)                 # (2, n_obs, D)
 
-        obs_batch = np.stack([_build(q_l, ee_l, et_l), _build(q_r, ee_r, et_r)], axis=0)
-        # 模型 global_cond_dim = n_obs_steps × obs_dim，必须重复到 n_obs_steps 帧
-        n_obs = self.policy.n_obs_steps
-        obs_ts = torch.from_numpy(obs_batch).float().to(self.device)  # (2, 20)
-        obs_ts = obs_ts.unsqueeze(1).repeat(1, n_obs, 1)              # (2, n_obs_steps, 20)
-        with torch.no_grad():
-            res = self.policy.predict_action({"obs": obs_ts})
-        actions = res["action_pred"].cpu().numpy()
-        if actions.ndim == 3:
-            actions = actions[:, 0, :]
-        return actions[0], actions[1]
+        et_batch = np.stack([et_l[:7], et_r[:7]], axis=0)                # (2, 7)
+        dq_prev_t = None
+        if self._dq_prev_l is not None and self._dq_prev_r is not None:
+            dq_prev_t = torch.from_numpy(
+                np.stack([self._dq_prev_l, self._dq_prev_r], axis=0)
+            ).float().to(self.device)
+
+        results = self._predict(obs_ts, et_batch, dq_prev_t)             # (2, act_dim)
+        self._dq_prev_l = results[0].copy()
+        self._dq_prev_r = results[1].copy()
+        return results[0], results[1]
 
 class PinocchioIKSolver(BaseIKSolver):
     def __init__(self, urdf_path, ee_link="link_eef"):
@@ -479,7 +637,14 @@ def main():
         "--urdf",
         default="diffusion_policy/urdf_data/play_g2_usb_cam/urdf/play_g2_usb_cam.urdf",
     )
-    parser.add_argument("--robot", default="airbot_single_arm")
+    parser.add_argument("--robot",   default="airbot_single_arm")
+    parser.add_argument("--ee_link", default="end_link", help="URDF 末端 link 名（默认 end_link）")
+    parser.add_argument("--use_ttg", action="store_true", help="启用 Test-Time Guidance")
+    parser.add_argument("--guidance_scale",    type=float, default=10.0)
+    parser.add_argument("--ttg_lambda_pose",   type=float, default=1.0,  help="TTG L_pose 权重")
+    parser.add_argument("--ttg_lambda_hist",   type=float, default=0.3,  help="TTG L_hist 权重（0 关闭）")
+    parser.add_argument("--ttg_lambda_smooth", type=float, default=0.05, help="TTG L_smooth 权重（0 关闭）")
+    parser.add_argument("--port", type=int, default=6162, help="服务端口（默认 6162）")
     args = parser.parse_args()
 
     if not os.path.exists(args.urdf):
@@ -494,7 +659,17 @@ def main():
 
     try:
         if choice == "1":
-            app.state.solver = NatureIKSolver(args.ckpt, args.robot)
+            app.state.solver = NatureIKSolver(
+                ckpt              = args.ckpt,
+                robot_name        = args.robot,
+                urdf_path         = args.urdf if args.use_ttg else None,
+                ee_link           = args.ee_link,
+                use_ttg           = args.use_ttg,
+                guidance_scale    = args.guidance_scale,
+                ttg_lambda_pose   = args.ttg_lambda_pose,
+                ttg_lambda_hist   = args.ttg_lambda_hist,
+                ttg_lambda_smooth = args.ttg_lambda_smooth,
+            )
         elif choice == "2":
             app.state.solver = PinocchioIKSolver(args.urdf)
         elif choice == "3":
@@ -503,9 +678,17 @@ def main():
             app.state.solver = PyBulletIKSolver(args.urdf)
         elif choice == "5":
             if args.mip_ckpt is None:
-                cprint(f"[!] 请通过 --mip_ckpt 指定 MIP checkpoint 路径", "red",)
+                cprint(f"[!] 请通过 --mip_ckpt 指定 MIP checkpoint 路径", "red")
                 return
-            app.state.solver = MIPIKSolver(args.mip_ckpt)
+            app.state.solver = MIPIKSolver(
+                ckpt              = args.mip_ckpt,
+                urdf_path         = args.urdf if args.use_ttg else None,
+                ee_link           = args.ee_link,
+                use_ttg           = args.use_ttg,
+                ttg_lambda_pose   = args.ttg_lambda_pose,
+                ttg_lambda_hist   = args.ttg_lambda_hist,
+                ttg_lambda_smooth = args.ttg_lambda_smooth,
+            )
         else:
             return
     except Exception as e:
@@ -514,10 +697,10 @@ def main():
 
     app.state.logger = ExperimentLogger()
     cprint(
-        f"🚀 服务已启动 [Port 6162] | 模式: {app.state.solver.__class__.__name__}",
+        f"🚀 服务已启动 [Port {args.port}] | 模式: {app.state.solver.__class__.__name__} | TTG: {args.use_ttg}",
         "green",
     )
-    uvicorn.run(app, host="0.0.0.0", port=6162, log_level="warning")
+    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

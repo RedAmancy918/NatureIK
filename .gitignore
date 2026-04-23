@@ -13,7 +13,7 @@ fuse.cfg
 
 *.ai
 
-# Generation results (only top-level; experiments/results/ should be tracked)
+# Generation results（顶层 outputs；与 experiments/ 无关）
 /results/
 
 ray/auth.json
@@ -184,10 +184,16 @@ mip/tmp/
 mip/cache/
 mip/node_modules/
 
-# Experiment checkpoints — model weights (large files)
-# Individual *.pt / *.ckpt files are already ignored above.
-# Explicitly list the whole subtree for clarity.
-experiments/checkpoints/
+# Experiments: 整棵目录不纳入版本控制（配置、结果、checkpoint 等）
+experiments/
+experiment/
+experiments_*/
+*_experiments/
+runs/
+mlruns/
+lightning_logs/
+tensorboard/
+tb_logs/
 
 # NCF raw sensor data & processed point clouds (large files)
 # Top-level 'data' entry above already covers these; listed explicitly for clarity.
@@ -197,7 +203,4 @@ data/ncf_processed/
 # Paper videos (large files already covered by *.mp4 / *.mov above)
 paper/videos/
 
-# Tracked (do NOT ignore):
-#   experiments/configs/     — ablation config files
-#   experiments/results/     — evaluation CSVs (small, useful for paper)
-#   experiments/registry.csv — experiment log
+# 若需保留少量实验配置模板，可单独放在 repo 内非 experiments/ 路径（例如 configs/templates/）。
